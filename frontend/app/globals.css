@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #080b11;
+    color: #e2e8f0;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background-image: radial-gradient(circle at 50% 50%, #0d1527 0%, #080b11 100%);
+    background-attachment: fixed;
+    overflow-x: hidden;
+  }
+}
+
+/* Glassmorphism custom classes */
+.glass-panel {
+  background: rgba(16, 22, 35, 0.65);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-panel-interactive {
+  background: rgba(16, 22, 35, 0.65);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-panel-interactive:hover {
+  background: rgba(22, 30, 49, 0.75);
+  border-color: rgba(0, 240, 255, 0.3);
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.15);
+  transform: translateY(-2px);
+}
+
+/* Custom cyber-input */
+.cyber-input {
+  background: rgba(8, 12, 21, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e2e8f0;
+  transition: all 0.2s ease-in-out;
+}
+
+.cyber-input:focus {
+  border-color: #00f0ff;
+  box-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
+  outline: none;
+}
+
+/* Futuristic Scanline Effect */
+.scanlines {
+  position: relative;
+  overflow: hidden;
+}
+
+.scanlines::before {
+  content: " ";
+  display: block;
+  position: absolute;
+  top: 0; left: 0; bottom: 0; right: 0;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+  z-index: 2;
+  background-size: 100% 2px, 3px 100%;
+  pointer-events: none;
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(8, 11, 17, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(59, 130, 246, 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 240, 255, 0.5);
+}
