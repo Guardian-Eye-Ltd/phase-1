@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { Camera, Activity, AlertCircle, WifiOff } from "lucide-react";
+import apiClient from "@/services/api";
 
 interface CameraFeedCardProps {
   cameraId: number;
@@ -25,7 +26,7 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
 
     const connect = () => {
       if (!isMounted) return;
-      
+
       if (!cameraActive) {
         setStatus("OFFLINE");
         return;
@@ -39,12 +40,12 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
 
       // Determine WS URL based on current host or environment variable
       const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const host = process.env.NEXT_PUBLIC_API_URL 
-        ? new URL(process.env.NEXT_PUBLIC_API_URL).host 
+      const host = process.env.NEXT_PUBLIC_API_URL
+        ? new URL(process.env.NEXT_PUBLIC_API_URL).host
         : window.location.hostname + ":8000";
-      
+
       const wsUrl = `${wsProtocol}//${host}/api/v1/streams/${cameraId}?token=${token}`;
-      
+
       console.log(`Connecting to WS: ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
@@ -58,7 +59,7 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
 
       ws.onmessage = async (event) => {
         if (!isMounted) return;
-        
+
         if (typeof event.data === "string") {
           try {
             const data = JSON.parse(event.data);
@@ -126,7 +127,7 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
       if (cameraActive && wsRef.current) {
         wsRef.current.close();
       }
-      
+
       const response = await apiClient.post(`/cameras/${cameraId}/toggle`);
       setCameraActive(response.data.is_active);
     } catch (error) {
@@ -170,11 +171,10 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
           <p className="text-cyberMuted text-xs mt-1">{location}</p>
         </div>
         <div className="flex space-x-2">
-          <button 
+          <button
             onClick={toggleStream}
-            className={`px-2 py-1 text-xs rounded border transition-colors ${
-              cameraActive ? "border-red-500/50 text-red-500 hover:bg-red-500/10" : "border-green-500/50 text-green-500 hover:bg-green-500/10"
-            }`}
+            className={`px-2 py-1 text-xs rounded border transition-colors ${cameraActive ? "border-red-500/50 text-red-500 hover:bg-red-500/10" : "border-green-500/50 text-green-500 hover:bg-green-500/10"
+              }`}
           >
             {cameraActive ? "PAUSE" : "RESUME"}
           </button>
@@ -184,16 +184,16 @@ export default function CameraFeedCard({ cameraId, cameraName, location, isActiv
           </div>
         </div>
       </div>
-      
+
       {/* Video Area */}
       <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden group">
-        <canvas 
-          ref={canvasRef} 
-          width={1280} 
-          height={720} 
+        <canvas
+          ref={canvasRef}
+          width={1280}
+          height={720}
           className="w-full h-full object-contain"
         />
-        
+
         {status !== "LIVE" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm text-center">
             {getStatusIcon()}

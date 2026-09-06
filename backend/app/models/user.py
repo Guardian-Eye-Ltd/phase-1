@@ -2,15 +2,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import String, Integer, ForeignKey, Boolean, DateTime, func
 from app.database.base import Base
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Avoid circular imports in type checking layer
     from app.models.role import Role
+    from app.models.evidence import Evidence
+    from app.models.audit import AuditLog
 
 class User(Base):
     """
-    SQLAlchemy model representing a platform user (operator, investigator, admin).
+    SQLAlchemy model representing a platform user (investigator, admin, operator).
     """
     __tablename__ = "users"
 
@@ -34,8 +35,10 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
-    # Many-to-One: Many Users can map to a single Role
+    # Relationships
     role: Mapped["Role"] = relationship(back_populates="users")
+    evidence_files: Mapped[List["Evidence"]] = relationship(back_populates="uploader", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="user")
 
     def __repr__(self) -> str:
         return f"<User id={self.id}, username='{self.username}', role_id={self.role_id}>"

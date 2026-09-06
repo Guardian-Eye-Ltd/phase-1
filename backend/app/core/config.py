@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     DEMO_CAMERA_005_SOURCE: str = "rtsp://127.0.0.1:8554/camera05"
     DEMO_CAMERA_006_SOURCE: str = "rtsp://127.0.0.1:8554/camera06"
 
+    # Evidence Storage Config
+    STORAGE_DIR: str = "storage/evidence"
+    DERIVED_STORAGE_DIR: str = "storage/derived"
+    MAX_UPLOAD_SIZE_MB: int = 500
+    ALLOWED_EXTENSIONS: List[str] = ["mp4", "webm", "avi", "mov", "mkv"]
+
     # PostgreSQL Database Config
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_USER: str = "postgres"

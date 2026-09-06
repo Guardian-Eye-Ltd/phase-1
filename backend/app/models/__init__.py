@@ -1,7 +1,18 @@
 from app.models.role import Role
 from app.models.user import User
+from app.models.evidence import Evidence, EvidenceStatus
+from app.models.audit import AuditLog
 from app.models.camera import Camera
 from app.models.alert import Alert
 from app.models.incident import Incident
+from app.models.analysis import (
+    AnalysisJob, JobStatus, JobStage, ActivityInterval, ActivityLevel,
+    FrameObservation, Detection, Track, Keyframe, KeyframeReason, PossibleInteraction
+)
 
-__all__ = ["Role", "User", "Camera", "Alert", "Incident"]
+__all__ = [
+    "Role", "User", "Evidence", "EvidenceStatus", "AuditLog", "Camera", "Alert", "Incident",
+    "AnalysisJob", "JobStatus", "JobStage", "ActivityInterval", "ActivityLevel",
+    "FrameObservation", "Detection", "Track", "Keyframe", "KeyframeReason", "PossibleInteraction"
+]
+

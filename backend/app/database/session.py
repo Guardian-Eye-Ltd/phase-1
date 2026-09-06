@@ -1,12 +1,14 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.core.config import settings
 
-# Create async engine with postgresql+asyncpg database URL
+is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+engine_kwargs = {"echo": False, "future": True}
+if not is_sqlite:
+    engine_kwargs["pool_pre_ping"] = True
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,  # Automatically detect and recover lost connections
+    **engine_kwargs
 )
 
 # Configure the sessionmaker for asynchronous database sessions

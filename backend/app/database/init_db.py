@@ -69,6 +69,33 @@ async def seed_admin_user():
                 await session.commit()
                 logger.info("Seeded initial system admin user (username: admin).")
 
+async def seed_investigator_user():
+    """
+    Seed initial investigator user account if no investigator exists.
+    """
+    async with SessionLocal() as session:
+        stmt = select(User).where(User.username == "investigator")
+        res = await session.execute(stmt)
+        inv_user = res.scalars().first()
+        if not inv_user:
+            inv_role_stmt = select(Role).where(Role.role_name == "Investigator")
+            inv_role_res = await session.execute(inv_role_stmt)
+            inv_role = inv_role_res.scalars().first()
+            
+            if inv_role:
+                hashed_pw = hash_password("Investigator123!")
+                new_inv = User(
+                    full_name="Lead Forensic Investigator",
+                    username="investigator",
+                    email="investigator@guardianeye.io",
+                    password_hash=hashed_pw,
+                    role_id=inv_role.id,
+                    is_active=True
+                )
+                session.add(new_inv)
+                await session.commit()
+                logger.info("Seeded initial investigator user (username: investigator).")
+
 from app.core.config import settings
 
 async def seed_mock_data():
@@ -128,4 +155,5 @@ async def init_db(db_engine: AsyncEngine = engine):
     await create_tables(db_engine)
     await seed_roles()
     await seed_admin_user()
+    await seed_investigator_user()
     await seed_mock_data()
