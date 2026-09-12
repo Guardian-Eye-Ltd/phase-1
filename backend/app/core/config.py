@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 500
     ALLOWED_EXTENSIONS: List[str] = ["mp4", "webm", "avi", "mov", "mkv"]
 
+    # Phase 1C Semantic Intelligence Config
+    VLM_ENABLED: bool = True
+    VLM_MODEL_NAME: str = "Salesforce/blip-image-captioning-base"
+    MAX_KEYFRAMES_FOR_VLM: int = 30
+    EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
+    VECTOR_DB_TYPE: str = "chromadb"
+    VECTOR_DB_PATH: str = "storage/chroma_db"
+    DEVICE: str = "cpu"
+    EMBEDDING_BATCH_SIZE: int = 32
+
     # PostgreSQL Database Config
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_USER: str = "postgres"

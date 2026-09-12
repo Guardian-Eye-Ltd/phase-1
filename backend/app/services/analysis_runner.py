@@ -279,7 +279,7 @@ async def run_analysis_job_async(job_id: int):
                 action="ANALYSIS_COMPLETED",
                 resource_type="ANALYSIS_JOB",
                 resource_id=str(job.id),
-                details=f"Analysis completed for evidence '{evidence.original_filename}'. Hash: {manifest_hash[:16]}..."
+                metadata_json=f"Analysis completed for evidence '{evidence.original_filename}'. Hash: {manifest_hash[:16]}..."
             )
             db.add(audit_log)
             await db.commit()
@@ -303,7 +303,7 @@ async def run_analysis_job_async(job_id: int):
                 action="ANALYSIS_FAILED",
                 resource_type="ANALYSIS_JOB",
                 resource_id=str(job.id),
-                details=f"Analysis failed for evidence '{evidence.original_filename}': {str(e)}"
+                metadata_json=f"Analysis failed for evidence '{evidence.original_filename}': {str(e)}"
             )
             db.add(audit_log)
             await db.commit()

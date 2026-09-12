@@ -3,7 +3,7 @@
 import React from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import ProtectedRoute from "./ProtectedRoute";
-import { LogOut, LayoutDashboard, Film, UploadCloud, ShieldCheck, Activity, FileText } from "lucide-react";
+import { LogOut, LayoutDashboard, Film, UploadCloud, ShieldCheck, Activity, FileText, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -14,10 +14,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const navItems = [
     { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
     { href: "/evidence", label: "Evidence Vault", icon: Film },
+    { href: "/forensic/search", label: "Semantic Search", icon: Sparkles },
     { href: "/evidence/upload", label: "Upload Evidence", icon: UploadCloud },
     { href: "/audit", label: "Audit Log", icon: FileText },
     { href: "/system-status", label: "System Status", icon: Activity },
   ];
+
 
   return (
     <ProtectedRoute>
@@ -41,8 +43,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   key={item.href}
                   href={item.href}
                   className={`flex items-center px-4 py-3 rounded-lg text-sm font-medium transition-all ${isActive
-                      ? "bg-cyberCyan/15 text-cyberCyan border border-cyberCyan/40 shadow-sm shadow-cyberCyan/10 font-semibold"
-                      : "text-gray-400 hover:bg-cyberDark hover:text-cyberCyan"
+                    ? "bg-cyberCyan/15 text-cyberCyan border border-cyberCyan/40 shadow-sm shadow-cyberCyan/10 font-semibold"
+                    : "text-gray-400 hover:bg-cyberDark hover:text-cyberCyan"
                     }`}
                 >
                   <Icon className="w-5 h-5 mr-3 shrink-0" />

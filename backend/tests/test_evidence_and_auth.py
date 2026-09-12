@@ -46,7 +46,8 @@ async def test_evidence_upload_and_sha256():
         headers = {"Authorization": f"Bearer {token}"}
 
         # 2. Prepare mock MP4 video content
-        video_content = b"FAKEMP4VIDEOCONTENT_FORENSIC_TEST_DATA_12345"
+        import uuid
+        video_content = f"FAKEMP4VIDEOCONTENT_{uuid.uuid4().hex}".encode('utf-8')
         expected_sha256 = hashlib.sha256(video_content).hexdigest()
 
         files = {"file": ("cctv_test_feed.mp4", io.BytesIO(video_content), "video/mp4")}

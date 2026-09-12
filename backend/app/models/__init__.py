@@ -9,10 +9,17 @@ from app.models.analysis import (
     AnalysisJob, JobStatus, JobStage, ActivityInterval, ActivityLevel,
     FrameObservation, Detection, Track, Keyframe, KeyframeReason, PossibleInteraction
 )
+from app.models.semantic import (
+    ForensicDocument, DocumentType, DocumentSourceType, ConfidenceLevel,
+    VLMObservation, EmbeddingRecord, SearchQuery, SearchResult, AIModelExecution
+)
 
 __all__ = [
     "Role", "User", "Evidence", "EvidenceStatus", "AuditLog", "Camera", "Alert", "Incident",
     "AnalysisJob", "JobStatus", "JobStage", "ActivityInterval", "ActivityLevel",
-    "FrameObservation", "Detection", "Track", "Keyframe", "KeyframeReason", "PossibleInteraction"
+    "FrameObservation", "Detection", "Track", "Keyframe", "KeyframeReason", "PossibleInteraction",
+    "ForensicDocument", "DocumentType", "DocumentSourceType", "ConfidenceLevel",
+    "VLMObservation", "EmbeddingRecord", "SearchQuery", "SearchResult", "AIModelExecution"
 ]
+
 
