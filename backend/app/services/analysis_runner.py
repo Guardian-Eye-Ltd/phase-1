@@ -102,15 +102,17 @@ async def run_analysis_job_async(job_id: int):
                 target_fps=job.sampling_fps
             ))
 
-            for fn, ts, frame in sampled_frames:
-                frame_obs = FrameObservation(
+            # Batch insert frame observations
+            db.add_all([
+                FrameObservation(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     frame_number=fn,
                     timestamp=ts
                 )
-                db.add(frame_obs)
-            await db.commit()
+                for fn, ts, _ in sampled_frames
+            ])
+            await db.flush()
 
             logger.info(f"[FRAME] Sampled {len(sampled_frames)} frames out of {video_info['frame_count']} total video frames.")
 
@@ -123,8 +125,8 @@ async def run_analysis_job_async(job_id: int):
             await db.commit()
 
             motion_intervals = MotionFilter.analyze_motion(sampled_frames)
-            for mi in motion_intervals:
-                interval_obj = ActivityInterval(
+            db.add_all([
+                ActivityInterval(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     start_time=mi["start_time"],
@@ -134,8 +136,9 @@ async def run_analysis_job_async(job_id: int):
                     activity_level=mi["activity_level"],
                     motion_score=mi["motion_score"]
                 )
-                db.add(interval_obj)
-            await db.commit()
+                for mi in motion_intervals
+            ])
+            await db.flush()
 
             # Stage 5: Object Detection
             if job_id in active_job_cancellations:
@@ -185,9 +188,9 @@ async def run_analysis_job_async(job_id: int):
 
                 track_summaries = MultiObjectTracker.generate_track_summaries(final_detections)
 
-            # Save Detections & Tracks
-            for d in final_detections:
-                det_obj = Detection(
+            # Batch Save Detections & Tracks
+            db.add_all([
+                Detection(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     frame_number=d["frame_number"],
@@ -200,10 +203,11 @@ async def run_analysis_job_async(job_id: int):
                     bbox_y2=d["bbox_y2"],
                     track_id=d.get("track_id")
                 )
-                db.add(det_obj)
+                for d in final_detections
+            ])
 
-            for trk in track_summaries:
-                trk_obj = Track(
+            db.add_all([
+                Track(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     track_number=trk["track_number"],
@@ -216,8 +220,9 @@ async def run_analysis_job_async(job_id: int):
                     observation_count=trk["observation_count"],
                     keyframe_count=0
                 )
-                db.add(trk_obj)
-            await db.commit()
+                for trk in track_summaries
+            ])
+            await db.flush()
 
             # Stage 7: Keyframe Extraction & Spatial Interaction Detection
             if job_id in active_job_cancellations:
@@ -235,8 +240,8 @@ async def run_analysis_job_async(job_id: int):
                 settings.DERIVED_STORAGE_DIR
             )
 
-            for k in keyframes_data:
-                kf_obj = Keyframe(
+            db.add_all([
+                Keyframe(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     frame_number=k["frame_number"],
@@ -247,11 +252,12 @@ async def run_analysis_job_async(job_id: int):
                     track_ids=k["track_ids"],
                     detection_ids=k["detection_ids"]
                 )
-                db.add(kf_obj)
+                for k in keyframes_data
+            ])
 
             interactions = InteractionDetector.detect_interactions(final_detections)
-            for inter in interactions:
-                inter_obj = PossibleInteraction(
+            db.add_all([
+                PossibleInteraction(
                     analysis_job_id=job.id,
                     evidence_id=evidence.id,
                     entity_a_track_id=inter["entity_a_track_id"],
@@ -262,7 +268,8 @@ async def run_analysis_job_async(job_id: int):
                     confidence_score=inter["confidence_score"],
                     label=inter["label"]
                 )
-                db.add(inter_obj)
+                for inter in interactions
+            ])
             await db.commit()
 
             # Stage 8: Event Engine & Manifest Generation

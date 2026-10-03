@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download YOLO weights during build
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
 COPY . .
 
 EXPOSE 8000
