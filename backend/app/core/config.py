@@ -34,15 +34,38 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 500
     ALLOWED_EXTENSIONS: List[str] = ["mp4", "webm", "avi", "mov", "mkv"]
 
+    # Phase 1 Pipeline & Video Processing Config
+    FRAME_SAMPLE_FPS: float = 2.0
+    DETECTION_INTERVAL: int = 1
+    KEYFRAME_INTERVAL: float = 10.0
+    MAX_PROCESSING_RESOLUTION: int = 1920
+    YOLO_MODEL_NAME: str = "yolov8n.pt"
+    DETECTION_CONFIDENCE_THRESHOLD: float = 0.25
+    DETECTION_IOU_THRESHOLD: float = 0.45
+
     # Phase 1C Semantic Intelligence Config
     VLM_ENABLED: bool = True
     VLM_MODEL_NAME: str = "Salesforce/blip-image-captioning-base"
     MAX_KEYFRAMES_FOR_VLM: int = 30
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
+    EMBEDDING_MODEL_VERSION: str = "1.0"
+    INDEX_VERSION: str = "1.0"
     VECTOR_DB_TYPE: str = "chromadb"
     VECTOR_DB_PATH: str = "storage/chroma_db"
     DEVICE: str = "cpu"
     EMBEDDING_BATCH_SIZE: int = 32
+    MIN_SEARCH_RELEVANCE: float = 0.40
+
+    # Agent & LLM Provider Config
+    LLM_PROVIDER: str = "ollama"  # "ollama", "openai", "groq", "heuristics"
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL_NAME: str = "gpt-4o-mini"
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL_NAME: str = "llama3"
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
+    MAX_AGENT_STEPS: int = 10
+    INVESTIGATION_TIMEOUT_SECONDS: float = 60.0
 
     # PostgreSQL Database Config
     POSTGRES_SERVER: str = "localhost"

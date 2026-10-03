@@ -102,16 +102,36 @@ class ForensicDocumentGenerator:
                 end_str = cls.format_timestamp(inter.end_time)
                 spatial_summary_lines.append(f"Near Track {other_track} ({start_str}–{end_str})")
 
-            start_time_str = cls.format_timestamp(trk.first_seen_timestamp)
-            end_time_str = cls.format_timestamp(trk.last_seen_timestamp)
+            # Extract visual attributes from associated detections
+            upper_colors = [getattr(d, 'upper_garment_color', None) for d in associated_dets if getattr(d, 'upper_garment_color', None) and getattr(d, 'upper_garment_color', None) != 'unknown']
+            lower_colors = [getattr(d, 'lower_garment_color', None) for d in associated_dets if getattr(d, 'lower_garment_color', None) and getattr(d, 'lower_garment_color', None) != 'unknown']
+            veh_colors = [getattr(d, 'vehicle_color', None) for d in associated_dets if getattr(d, 'vehicle_color', None) and getattr(d, 'vehicle_color', None) != 'unknown']
+            carries_bag = any(getattr(d, 'carries_bag', False) for d in associated_dets) or any(obj in ["backpack", "handbag", "suitcase", "bag"] for obj in associated_objects)
 
+            attr_parts = []
+            dom_upper = upper_colors[0] if upper_colors else None
+            dom_lower = lower_colors[0] if lower_colors else None
+            dom_veh = veh_colors[0] if veh_colors else None
+
+            if dom_upper:
+                attr_parts.append(f"wearing {dom_upper} upper garment/shirt")
+            if dom_lower:
+                attr_parts.append(f"wearing {dom_lower} lower garment/pants")
+            if dom_veh:
+                attr_parts.append(f"{dom_veh} body color")
+            if carries_bag:
+                attr_parts.append("carrying a backpack/bag")
+                if "backpack" not in associated_objects:
+                    associated_objects.append("backpack")
+
+            attr_text = f" Visual attributes: {', '.join(attr_parts)}." if attr_parts else ""
             assoc_obj_text = f" The track was associated with {', '.join(associated_objects)} detections in multiple frames." if associated_objects else ""
             spatial_text = f" Spatial interactions noted: {'; '.join(spatial_summary_lines)}." if spatial_summary_lines else ""
 
             content_text = (
                 f"{trk.class_name.capitalize()} Track {trk.track_number} was observed between {start_time_str} and {end_time_str} "
                 f"(Duration: {int(trk.duration)}s, Observations: {trk.observation_count})."
-                f"{assoc_obj_text}{spatial_text}"
+                f"{attr_text}{assoc_obj_text}{spatial_text}"
             )
 
             doc = ForensicDocument(
@@ -129,6 +149,10 @@ class ForensicDocumentGenerator:
                     "track_number": trk.track_number,
                     "class_name": trk.class_name,
                     "duration": trk.duration,
+                    "upper_garment_color": dom_upper,
+                    "lower_garment_color": dom_lower,
+                    "vehicle_color": dom_veh,
+                    "carries_bag": carries_bag,
                     "associated_objects": associated_objects,
                     "observation_count": trk.observation_count,
                     "spatial_interactions": spatial_summary_lines,
@@ -212,12 +236,16 @@ class ForensicDocumentGenerator:
         # -------------------------------------------------------------
         # Part D: Generate Spatial Interaction Documents
         # -------------------------------------------------------------
+        track_dict = {t.track_number: t for t in tracks}
         for inter in interactions:
             start_str = cls.format_timestamp(inter.start_time)
             end_str = cls.format_timestamp(inter.end_time)
 
+            class_a = track_dict[inter.entity_a_track_id].class_name.capitalize() if inter.entity_a_track_id in track_dict else "Entity"
+            class_b = track_dict[inter.entity_b_track_id].class_name.capitalize() if inter.entity_b_track_id in track_dict else "Entity"
+
             inter_content = (
-                f"Track {inter.entity_a_track_id} was observed in close spatial proximity near Track {inter.entity_b_track_id} "
+                f"{class_a} Track {inter.entity_a_track_id} was observed in close spatial proximity near {class_b} Track {inter.entity_b_track_id} "
                 f"between {start_str} and {end_str} with interaction confidence score {inter.confidence_score:.2f}."
             )
 

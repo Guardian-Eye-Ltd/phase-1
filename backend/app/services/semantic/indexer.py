@@ -50,6 +50,15 @@ class SemanticIndexer:
 
         try:
             async with SessionLocal() as db:
+                # Stage 0: Clean up any existing documents from prior indexing (idempotent re-index)
+                from app.models.semantic import EmbeddingRecord, VLMObservation
+                from sqlalchemy import delete
+                await db.execute(delete(EmbeddingRecord).where(EmbeddingRecord.evidence_id == evidence_id))
+                await db.execute(delete(VLMObservation).where(VLMObservation.evidence_id == evidence_id))
+                await db.execute(delete(ForensicDocument).where(ForensicDocument.evidence_id == evidence_id))
+                await db.commit()
+                logger.info(f"Cleaned up prior semantic index data for evidence {evidence_id}.")
+
                 # Stage 1: Generate Forensic Documents from Phase 1B observations
                 logger.info(f"Generating ForensicDocuments for evidence {evidence_id}...")
                 docs = await ForensicDocumentGenerator.generate_documents_for_job(

@@ -1,175 +1,130 @@
-# GuardianEye — Intelligent Video Digital Forensics Platform (Phase 1 Foundation)
+# GuardianEye
 
-**GuardianEye** is an enterprise-grade, intelligent video digital forensics platform designed for cyber security investigators, law enforcement, and forensic analysts to ingest, verify, stream, and analyze CCTV video evidence.
+GuardianEye is an AI-powered intelligent video surveillance, investigation, and digital forensics platform. The system is designed to analyze CCTV footage, identify relevant forensic events (objects, people, activities), and allow natural language semantic searches against the video evidence.
+
+## Architecture & Technology Stack
+
+The project uses a modern decoupled architecture:
+
+### Frontend
+- **Framework:** Next.js 14 (App Router)
+- **Language:** TypeScript
+- **Styling:** TailwindCSS
+- **Icons:** Lucide React
+- **Data Fetching:** Axios
+
+### Backend & AI Engine
+- **Framework:** FastAPI (Python)
+- **Database:** SQLite (aiosqlite) with SQLAlchemy (Asynchronous ORM)
+- **Authentication:** JWT (JSON Web Tokens)
+- **Computer Vision Pipeline:** 
+  - **Detections:** YOLOv8 (ultralytics) / OpenCV
+  - **Tracking:** Custom Hybrid IoU + Centroid Tracker
+- **Semantic Search (Phase 1C):**
+  - **Vision-Language Model (VLM):** BLIP via Hugging Face `transformers`
+  - **Vector Database:** ChromaDB
+  - **Embeddings:** `sentence-transformers`
 
 ---
 
-## 🏛️ Phase 1 Architecture Overview
+## Core Features
 
-Phase 1 establishes a modular, secure software foundation designed specifically to support future computer vision and AI video analysis engines (YOLO, DeepSORT/Re-ID, Qwen-VL/LLaVA, ChromaDB vector search) without requiring architectural redesigns.
+- **Evidence Ingestion:** Secure upload, SHA-256 cryptographic hashing, and duplicate detection.
+- **Computer Vision Pipeline:** Automated frame sampling, motion filtering, YOLO-based object detection, and multi-object tracking.
+- **Forensic Keyframe Extraction:** Intelligent extraction of keyframes based on track entries, exits, and visual anomalies.
+- **Action & Interaction Detection:** Captures spatial proximity and interaction between tracked entities.
+- **Vision-Language Analysis:** Natural language visual descriptions of keyframes using advanced VLMs.
+- **Semantic Hybrid Search:** Search video events using natural language (e.g., *"Find a person carrying a backpack near a vehicle"*).
 
+---
+
+## Setup Instructions
+
+### Prerequisites
+- Python 3.10+
+- Node.js 18+
+
+### 1. Backend Setup
+
+Open a terminal and navigate to the `backend` directory:
+
+```bash
+cd backend
+
+# Create a virtual environment
+python -m venv venv
+
+# Activate the virtual environment
+# On Windows:
+venv\Scripts\activate
+# On macOS/Linux:
+source venv/bin/activate
+
+# Install all required Python dependencies
+pip install -r requirements.txt
 ```
-                  ┌───────────────────────────────────────────────────────────┐
-                  │                 Next.js 14 Frontend UI                    │
-                  │   (Dark Cybersecurity Forensics Theme, Vault, Player)     │
-                  └─────────────────────────────┬─────────────────────────────┘
-                                                │ REST API / HTTP Range
-                                                ▼
-                  ┌───────────────────────────────────────────────────────────┐
-                  │                 FastAPI Backend Engine                    │
-                  │   - JWT Auth & Role-Based Access Control (RBAC)           │
-                  │   - Evidence Ingestion & SHA-256 Integrity Service        │
-                  │   - HTTP Range Video Streaming Engine                     │
-                  │   - Background Pipeline Queue & Audit Logging             │
-                  └──────┬──────────────────────┬──────────────────────┬──────┘
-                         │                      │                      │
-                         ▼                      ▼                      ▼
-           ┌────────────────────────┐┌──────────────────────┐┌───────────────────────┐
-           │ PostgreSQL Database    ││ Local Storage Vault  ││ Pluggable AI Modules  │
-           │ (Evidence & Audit Logs)││ (Immutable Originals)││ (Abstract Interfaces) │
-           └────────────────────────┘└──────────────────────┘└───────────────────────┘
+
+#### Running the Backend
+
+```bash
+# Start the FastAPI server using Uvicorn
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# OR alternatively:
+python main.py
+```
+The backend API will be running at `http://localhost:8000`. 
+Interactive API documentation is available at `http://localhost:8000/docs`.
+
+### 2. Frontend Setup
+
+Open a new terminal window and navigate to the `frontend` directory:
+
+```bash
+cd frontend
+
+# Install Node.js dependencies
+npm install
 ```
 
----
+#### Running the Frontend
 
-## 🔒 Key Forensics Features & Design Principles
-
-1. **SHA-256 Chain of Custody Integrity**:
-   - Every uploaded CCTV video is treated as an immutable evidence original.
-   - SHA-256 cryptographic hash is calculated via streaming chunks upon ingestion and saved to the database.
-   - Automatic duplicate detection alerts investigators when identical evidence files are uploaded.
-
-2. **Secure Video Streaming**:
-   - Supports HTTP Range requests (`bytes=0-`) to enable smooth seeking and frame scrubbing in high-definition CCTV footage without full memory loading.
-
-3. **Pluggable AI Module Architecture**:
-   - Defines standard abstract interfaces (`BaseDetectionService`, `BaseTrackingService`, `BaseTimelineService`, `BaseVLMService`, `BaseSearchService`) allowing future AI models to be plugged in seamlessly.
-
-4. **Security & Path Traversal Defense**:
-   - Strict UUID file renaming prevents directory traversal (`../`) and file overwrite attacks.
-   - Strict extension whitelist (`.mp4`, `.webm`, `.avi`, `.mov`, `.mkv`).
+```bash
+# Start the Next.js development server
+npm run dev
+```
+The frontend UI will be running at `http://localhost:3000`.
 
 ---
 
-## 📂 System Project Structure
+## Default Users
+
+When the database is initialized, two default accounts are generated for testing purposes:
+
+- **Admin Account:**
+  - Username: `admin`
+  - Password: `Admin123!`
+
+- **Investigator Account:**
+  - Username: `investigator`
+  - Password: `Investigator123!`
+
+---
+
+## Project Structure
 
 ```
 phase-1/
 ├── backend/
-│   ├── app/
-│   │   ├── api/routes/          # REST API endpoints (auth, evidence, audit, users)
-│   │   ├── core/                # JWT security, password hashing, environment config
-│   │   ├── database/            # SQLAlchemy async session & table seeders
-│   │   ├── models/              # DB Models (User, Role, Evidence, AuditLog)
-│   │   ├── schemas/             # Pydantic validation schemas
-│   │   └── services/            # Storage, Metadata, Audit, Evidence, and AI Interfaces
-│   ├── storage/                 # Local filesystem evidence vault (gitignored)
-│   ├── tests/                   # Pytest automated test suite
-│   ├── main.py                  # FastAPI application entry point
-│   ├── Dockerfile
-│   └── requirements.txt
-├── frontend/
-│   ├── app/                     # Next.js App Router (login, dashboard, evidence, audit)
-│   ├── components/              # UI components & Dashboard Layout
-│   ├── contexts/                # AuthContext (JWT state)
-│   ├── services/                # API client & Evidence services
-│   ├── types/                   # TypeScript evidence & audit interfaces
-│   └── Dockerfile
-└── docker-compose.yml           # Multi-container orchestration
+│   ├── app/                      # Main FastAPI application logic (routes, services, models)
+│   ├── storage/                  # Local storage for evidence, chroma vector db, and derived data
+│   ├── alembic/                  # Database migration scripts
+│   ├── main.py                   # FastAPI application entrypoint
+│   └── requirements.txt          # Python dependencies
+├── frontend/                     # Next.js web application
+│   ├── app/                      # Next.js page routing
+│   ├── components/               # Reusable React components
+│   ├── services/                 # Axios API clients
+│   └── types/                    # TypeScript interfaces
+├── docker-compose.yml            
+└── README.md                     # You are here!
 ```
-
----
-
-## 🚀 Quickstart Guide
-
-### Prerequisites
-- Node.js v18+ & npm
-- Python 3.10+
-- PostgreSQL 15 (or Docker)
-
-### Option A: Local Development Setup
-
-#### 1. Database Setup
-Ensure PostgreSQL is running locally on port 5432 and create a database named `guardianeye`:
-```bash
-createdb -U postgres guardianeye
-```
-
-#### 2. Backend Setup
-```bash
-cd backend
-python -m venv venv
-# On Windows PowerShell:
-.\venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
-*The database tables and default investigator accounts will be seeded automatically on startup.*
-
-#### 3. Frontend Setup
-```bash
-cd frontend
-npm install
-npm run dev
-```
-Open **[http://localhost:3000](http://localhost:3000)** in your browser.
-
----
-
-### Option B: Docker Compose Deployment
-
-Run the entire full-stack application (PostgreSQL + FastAPI + Next.js) with a single command:
-```bash
-docker-compose up --build
-```
-Access the application at:
-- **Frontend Dashboard**: `http://localhost:3000`
-- **FastAPI OpenAPI Docs**: `http://localhost:8000/docs`
-
----
-
-## 🔐 Default Demo Credentials
-
-| Role | Username | Password | Email |
-| :--- | :--- | :--- | :--- |
-| **Investigator** | `investigator` | `Investigator123!` | `investigator@guardianeye.io` |
-| **Administrator** | `admin` | `Admin123!` | `admin@guardianeye.io` |
-
----
-
-## 🧪 Running Automated Tests
-
-Run the backend Pytest test suite covering authentication, file upload integrity, duplicate hash detection, invalid format rejection, and audit logs:
-```bash
-cd backend
-python -m pytest -v tests/test_evidence_and_auth.py
-```
-
----
-
-## 🛰️ Key API Endpoints Reference
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/api/v1/auth/login` | Authenticate investigator and issue JWT token |
-| `POST` | `/api/v1/evidence/upload` | Upload CCTV video file & calculate SHA-256 hash |
-| `GET` | `/api/v1/evidence` | List evidence vault files with search and filters |
-| `GET` | `/api/v1/evidence/{id}` | Get detailed evidence metadata |
-| `GET` | `/api/v1/evidence/{id}/stream`| HTTP Range video streaming endpoint |
-| `POST` | `/api/v1/evidence/{id}/analysis`| Enqueue 8-stage post-event video analysis job |
-| `GET` | `/api/v1/evidence/analysis/{job_id}`| Real-time pipeline stage & percentage progress |
-| `POST` | `/api/v1/evidence/analysis/{job_id}/cancel`| Cancel active video analysis job |
-| `GET` | `/api/v1/evidence/{id}/detections`| List object/person detections & bounding boxes |
-| `GET` | `/api/v1/evidence/{id}/tracks`| Tracked entity summaries & lifetime metrics |
-| `GET` | `/api/v1/evidence/{id}/keyframes`| Extracted keyframe images & SHA-256 hashes |
-| `GET` | `/api/v1/evidence/{id}/timeline`| Chronological forensic observations timeline |
-| `GET` | `/api/v1/evidence/{id}/activity`| Motion activity intervals |
-| `GET` | `/api/v1/evidence/{id}/manifest`| Machine-readable JSON analysis manifest |
-| `GET` | `/api/v1/audit` | Retrieve chain-of-custody audit logs |
-
----
-
-## 🔮 Phase 1C AI Extension Roadmap
-
-- **Phase 1C**: Qwen-VL / LLaVA Vision-Language Model Investigation Assistant, ChromaDB Vector Evidence Indexing, Court-Admissible PDF Forensic Export.

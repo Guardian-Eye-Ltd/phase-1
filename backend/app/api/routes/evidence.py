@@ -25,7 +25,7 @@ async def upload_evidence(
 ):
     """
     Ingests CCTV video file, checks SHA-256 duplicate status, extracts metadata,
-    writes to isolated evidence storage, and enqueues background analysis pipeline.
+    writes to isolated evidence storage, and enqueues real Phase 1B analysis pipeline.
     """
     evidence, is_duplicate = await EvidenceService.upload_evidence(
         db=db,
@@ -34,9 +34,20 @@ async def upload_evidence(
     )
 
     if not is_duplicate:
-        # Enqueue background pipeline simulation (UPLOADED -> QUEUED -> PROCESSING -> COMPLETED)
-        background_tasks.add_task(EvidenceService.process_background_pipeline, evidence.id)
-        msg = "Evidence video successfully ingested and integrity hash recorded. Background pipeline enqueued."
+        # Auto-create and enqueue real Phase 1B analysis job
+        from app.models.analysis import AnalysisJob, JobStatus, JobStage
+        from app.services.analysis_runner import run_analysis_job_async
+        job = AnalysisJob(
+            evidence_id=evidence.id,
+            status=JobStatus.QUEUED,
+            current_stage=JobStage.VALIDATING,
+            progress=0.0,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        background_tasks.add_task(run_analysis_job_async, job.id)
+        msg = f"Evidence video successfully ingested. Analysis job #{job.id} enqueued."
     else:
         msg = "Identical evidence hash detected in database. Ingested record matched existing forensic record."
 

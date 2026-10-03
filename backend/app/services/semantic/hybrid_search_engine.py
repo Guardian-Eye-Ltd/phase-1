@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.models.analysis import Track, Keyframe, Detection, PossibleInteraction, ActivityInterval
 from app.models.semantic import (
     ForensicDocument, SearchQuery, SearchResult, ConfidenceLevel, DocumentSourceType, DocumentType, VLMObservation
@@ -13,10 +14,6 @@ from app.services.semantic.query_parser import QueryIntentParser
 from app.services.semantic.vector_service import VectorService
 
 logger = logging.getLogger(__name__)
-
-# Configurable Minimum Thresholds
-MIN_SEMANTIC_SCORE = 0.40
-MIN_PRIMARY_RESULT_SCORE = 0.50
 
 class HybridSearchEngine:
     """
@@ -38,10 +35,11 @@ class HybridSearchEngine:
         Executes multi-stage hybrid search query pipeline.
         """
         start_time_perf = time.time()
+        min_relevance_threshold = getattr(settings, "MIN_SEARCH_RELEVANCE", 0.40)
 
         # Step 1: Query Intent Extraction
         intent = QueryIntentParser.parse_query(query_text)
-        logger.info(f"Executing hybrid search for evidence {evidence_id}. Query: '{query_text}'. Intent: {intent}")
+        logger.info(f"[QUERY] Executing hybrid search for evidence #{evidence_id}. Query: '{query_text}'. Intent: {intent['query_type']}")
 
         # Record SearchQuery in DB
         db_query = SearchQuery(
@@ -55,8 +53,8 @@ class HybridSearchEngine:
         await db.commit()
         await db.refresh(db_query)
 
-        # Step 2: Query Routing - Track Query Direct DB Lookup
-        if intent["query_type"] == "TRACK_QUERY" and intent["track_id"] is not None:
+        # Step 2: Query Routing — Track Search Direct DB Lookup
+        if intent["query_type"] == "TRACK_SEARCH" and intent["track_id"] is not None:
             t_res = await db.execute(
                 select(Track).where(
                     Track.evidence_id == evidence_id,
@@ -133,6 +131,8 @@ class HybridSearchEngine:
             "end_time": intent["end_time"]
         }
 
+        logger.info(f"[FILTER] Vector filters applied: {vector_filters}")
+
         similar_docs = await VectorService.search_similar(
             db=db,
             evidence_id=evidence_id,
@@ -141,15 +141,18 @@ class HybridSearchEngine:
             filters=vector_filters
         )
 
+        logger.info(f"[RETRIEVAL] Retrieved {len(similar_docs)} candidate forensic documents from vector index.")
+
         # Step 4: Multi-Stage Hybrid Ranking, Verification & Threshold Filtering
         verified_results: List[Dict[str, Any]] = []
 
         for doc, sim in similar_docs:
-            # 4.1 Filter out disallowed document types (e.g. ACTIVITY_INTERVAL for person query)
+            # 4.1 Strict filtering by candidate document types
             if doc.document_type.value not in intent["candidate_document_types"]:
+                logger.info(f"[FILTER] Excluding candidate doc #{doc.id} ({doc.document_type.value}) - Not in allowed candidate types {intent['candidate_document_types']}.")
                 continue
 
-            # 4.2 DB Verification (Verify supporting track or keyframe exists)
+            # 4.2 DB Grounded Verification
             track_obj = None
             if doc.track_id is not None:
                 tr_res = await db.execute(
@@ -160,7 +163,7 @@ class HybridSearchEngine:
                 )
                 track_obj = tr_res.scalars().first()
                 if not track_obj:
-                    continue  # Invalid reference
+                    continue  # Invalid track reference
 
             kf_obj = None
             if doc.keyframe_id is not None:
@@ -172,10 +175,9 @@ class HybridSearchEngine:
                 )
                 kf_obj = kf_res.scalars().first()
 
-            # 4.3 Required Entity Matching (Hard Constraint)
+            # 4.3 Required Entity Matching
             doc_text_lower = f"{doc.title} {doc.content} {str(doc.metadata_json)}".lower()
             
-            # Fetch detections and VLM observations for deeper verification
             doc_detections: List[Detection] = []
             if doc.track_id is not None:
                 det_res = await db.execute(
@@ -184,7 +186,17 @@ class HybridSearchEngine:
                         Detection.track_id == doc.track_id
                     )
                 )
-                doc_detections = det_res.scalars().all()
+                doc_detections.extend(det_res.scalars().all())
+
+            if doc.metadata_json and isinstance(doc.metadata_json, dict) and "entity_b_track_id" in doc.metadata_json:
+                b_tr_id = doc.metadata_json["entity_b_track_id"]
+                det_res_b = await db.execute(
+                    select(Detection).where(
+                        Detection.evidence_id == evidence_id,
+                        Detection.track_id == b_tr_id
+                    )
+                )
+                doc_detections.extend(det_res_b.scalars().all())
             elif doc.keyframe_id is not None and kf_obj is not None:
                 det_res = await db.execute(
                     select(Detection).where(
@@ -192,7 +204,7 @@ class HybridSearchEngine:
                         Detection.frame_number == kf_obj.frame_number
                     )
                 )
-                doc_detections = det_res.scalars().all()
+                doc_detections.extend(det_res.scalars().all())
 
             vlm_descriptions = []
             if doc.keyframe_id is not None:
@@ -226,12 +238,12 @@ class HybridSearchEngine:
                             ent_found = True
                         elif any(w in combined_evidence_text for w in ["backpack", "bag", "rucksack", "pack", "knapsack"]):
                             ent_found = True
-                    elif req_ent in ["car", "vehicle", "truck"]:
-                        if track_obj and track_obj.class_name.lower() in ["car", "vehicle", "truck"]:
+                    elif req_ent in ["car", "vehicle", "truck", "bus"]:
+                        if track_obj and track_obj.class_name.lower() in ["car", "vehicle", "truck", "bus"]:
                             ent_found = True
-                        elif any(d.class_name.lower() in ["car", "vehicle", "truck"] for d in doc_detections):
+                        elif any(d.class_name.lower() in ["car", "vehicle", "truck", "bus"] for d in doc_detections):
                             ent_found = True
-                        elif any(w in combined_evidence_text for w in ["car", "vehicle", "automobile", "truck", "van"]):
+                        elif any(w in combined_evidence_text for w in ["car", "vehicle", "automobile", "truck", "van", "bus"]):
                             ent_found = True
                     else:
                         if req_ent in combined_evidence_text:
@@ -241,9 +253,9 @@ class HybridSearchEngine:
                         entity_matched = False
                         missing_entities.append(req_ent)
 
-            # Hard Constraint: Reject if required primary entity is missing completely
+            # Hard Constraint: Reject if primary entity is missing
             if intent["primary_entity"] and not entity_matched:
-                logger.info(f"Rejecting candidate doc #{doc.id} because required entity '{missing_entities}' was missing.")
+                logger.info(f"[VERIFICATION] Rejecting candidate doc #{doc.id} — Missing required primary entity '{missing_entities}'.")
                 continue
 
             # 4.4 Visual Attribute Matching (Colors & Clothing)
@@ -271,22 +283,21 @@ class HybridSearchEngine:
                         "formatted": f"Visual Attribute ({attr.upper()}): Not verified"
                     })
 
-            # Calculate Attribute Match Score
+            # Attribute match score
             if all_target_attrs:
                 attribute_score = matched_attr_count / len(all_target_attrs)
             else:
                 attribute_score = 1.0
 
-            # Calculate Entity Match Score
             entity_score = 1.0 if entity_matched else 0.0
 
-            # Calculate Temporal Score
+            # Temporal match score
             temporal_score = 1.0
             if intent["start_time"] is not None and doc.start_time is not None:
                 if not (intent["start_time"] <= doc.start_time <= (intent["end_time"] or 999999)):
                     temporal_score = 0.0
 
-            # Calculate Evidence Support Score
+            # Evidence support score
             frame_count = track_obj.observation_count if track_obj else (1 if kf_obj else 0)
             keyframe_count = len(doc.metadata_json.get("linked_keyframes", [])) if doc.metadata_json.get("linked_keyframes") else (1 if kf_obj else 0)
 
@@ -300,7 +311,7 @@ class HybridSearchEngine:
                 evidence_support_str = "LOW"
                 evidence_support_score = 0.4
 
-            # Detection confidence calculation
+            # Detection confidence
             det_conf = None
             if doc_detections:
                 det_conf = max(d.confidence for d in doc_detections)
@@ -308,7 +319,6 @@ class HybridSearchEngine:
                 det_conf = 0.91
 
             # 4.5 Multi-Stage Hybrid Score Calculation
-            # Final Score = 0.35 * Semantic + 0.30 * Entity + 0.20 * Attribute + 0.05 * Temporal + 0.10 * Evidence
             final_score = (
                 0.35 * sim +
                 0.30 * entity_score +
@@ -317,21 +327,21 @@ class HybridSearchEngine:
                 0.10 * evidence_support_score
             )
 
-            # Boost track match if specific track was requested
             if intent["track_id"] and doc.track_id == intent["track_id"]:
                 final_score += 0.20
 
-            # 4.6 Strict Minimum Threshold Filtering
-            if sim < MIN_SEMANTIC_SCORE or final_score < MIN_PRIMARY_RESULT_SCORE:
+            # 4.6 Enforce Strict Minimum Threshold
+            # Note: We rely on final_score for thresholding because strict sim thresholding blocks
+            # valid attribute matches (where sim might be low due to synonym/term mismatch but attributes match)
+            if final_score < min_relevance_threshold:
                 logger.info(
-                    f"Candidate doc #{doc.id} ({doc.title}) rejected. "
-                    f"Sim: {sim:.3f} (Min: {MIN_SEMANTIC_SCORE}), Final: {final_score:.3f} (Min: {MIN_PRIMARY_RESULT_SCORE})"
+                    f"[RANKING] Candidate doc #{doc.id} ({doc.title}) rejected. "
+                    f"Sim: {sim:.3f}, Final: {final_score:.3f} (Threshold: {min_relevance_threshold:.2f})"
                 )
                 continue
 
             query_relevance_pct = round(final_score * 100, 1)
 
-            # Overall confidence level indicator
             if evidence_support_str == "HIGH" and query_relevance_pct >= 50.0:
                 confidence_level = ConfidenceLevel.HIGH
             elif evidence_support_str in ["HIGH", "MEDIUM"] and query_relevance_pct >= 40.0:
@@ -379,14 +389,14 @@ class HybridSearchEngine:
             }
             verified_results.append(result_item)
 
-        # Sort by final score
+        # Sort results descending by score
         verified_results.sort(key=lambda x: x["score"], reverse=True)
         top_results = verified_results[:top_k]
 
         execution_time = (time.time() - start_time_perf) * 1000.0
         db_query.execution_time_ms = execution_time
 
-        # Save search results to DB for audit and provenance
+        # Save search results to DB
         for item in top_results:
             db_res = SearchResult(
                 search_query_id=db_query.id,
@@ -405,7 +415,7 @@ class HybridSearchEngine:
             db.add(db_res)
         await db.commit()
 
-        # Step 5: Anti-Hallucination Forensic Answer Formulation
+        # Step 5: Anti-Hallucination Forensic Response Formulation
         suggestions = [
             "Find people",
             "Find people carrying bags",
@@ -414,11 +424,18 @@ class HybridSearchEngine:
         ]
 
         if not top_results:
-            primary_ent_str = f"'{intent['primary_entity']}'" if intent["primary_entity"] else "requested"
+            if intent["primary_entity"]:
+                reason_str = f"did not contain supported '{intent['primary_entity']}' evidence"
+            elif intent["clothing"] or intent["colors"]:
+                attrs = "/".join(intent["clothing"] + intent["colors"])
+                reason_str = f"did not contain supported visual attributes ({attrs})"
+            else:
+                reason_str = "did not meet minimum forensic relevance requirements"
+                
             final_answer = (
-                f"NO SUPPORTED EVIDENCE FOUND: GuardianEye found no evidence meeting the minimum "
-                f"relevance threshold for: \"{query_text}\". "
-                f"Closest candidate records were excluded because they did not contain {primary_ent_str} evidence."
+                f"NO SUPPORTED EVIDENCE: GuardianEye found no sufficiently supported evidence meeting "
+                f"the minimum relevance threshold for: \"{query_text}\". "
+                f"Closest candidate records were excluded because they {reason_str}."
             )
         else:
             best_res = top_results[0]
@@ -427,6 +444,8 @@ class HybridSearchEngine:
                 f"(Track #{best_res['track_id'] or 'N/A'}, Query Relevance: {best_res['query_relevance']:.0f}%, "
                 f"Evidence Support: {best_res['evidence_support']})."
             )
+
+        logger.info(f"[VERIFICATION] Search completed. Found {len(top_results)} verified evidence-grounded results in {execution_time:.2f}ms.")
 
         return {
             "search_query_id": db_query.id,

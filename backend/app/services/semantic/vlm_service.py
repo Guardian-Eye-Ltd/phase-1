@@ -66,6 +66,29 @@ class VisionLanguageService:
         return sanitized
 
     @classmethod
+    def _resolve_keyframe_path(cls, api_path: str, evidence_id: int) -> str:
+        """
+        Resolves the actual filesystem path from a stored API URL path.
+        Example: /api/v1/evidence/1/derived/keyframes/keyframe_ev1_fn0.jpg
+              -> storage/derived/keyframes/1/keyframe_ev1_fn0.jpg
+        """
+        if not api_path:
+            return ""
+        try:
+            # Extract filename from the API path
+            filename = os.path.basename(api_path)
+            resolved = os.path.join(
+                settings.DERIVED_STORAGE_DIR,
+                "keyframes",
+                str(evidence_id),
+                filename
+            )
+            return resolved
+        except Exception as e:
+            logger.warning(f"Could not resolve keyframe path '{api_path}': {e}")
+            return ""
+
+    @classmethod
     async def analyze_keyframes_for_job(
         cls, 
         db: AsyncSession, 
@@ -100,14 +123,19 @@ class VisionLanguageService:
             det_classes = [d.class_name for d in frame_dets]
             track_ids = list(set([d.track_id for d in frame_dets if d.track_id is not None]))
 
+
             raw_description = ""
             confidence = 0.85
 
+            # Resolve actual filesystem path from the API URL stored in kf.image_path
+            # kf.image_path is like: /api/v1/evidence/{id}/derived/keyframes/keyframe_ev1_fn0.jpg
+            actual_image_path = cls._resolve_keyframe_path(kf.image_path, evidence_id)
+
             # If VLM is loaded and image file exists, run inference
-            if cls._vlm_pipeline and os.path.exists(kf.image_path):
+            if cls._vlm_pipeline and actual_image_path and os.path.exists(actual_image_path):
                 try:
                     from PIL import Image
-                    image = Image.open(kf.image_path).convert("RGB")
+                    image = Image.open(actual_image_path).convert("RGB")
                     vlm_out = cls._vlm_pipeline(image)
                     if vlm_out and len(vlm_out) > 0 and "generated_text" in vlm_out[0]:
                         raw_description = vlm_out[0]["generated_text"]

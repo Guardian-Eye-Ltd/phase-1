@@ -1,16 +1,21 @@
 import re
+import logging
 from typing import Dict, Any, Optional, List
+
+logger = logging.getLogger(__name__)
 
 class QueryIntentParser:
     """
-    Parses investigator natural language queries into structured search intents 
-    without requiring heavy LLM inference overhead.
+    Parses investigator natural language queries into structured forensic search intents
+    (OBJECT_SEARCH, TRACK_SEARCH, ATTRIBUTE_SEARCH, RELATIONSHIP_SEARCH, TEMPORAL_SEARCH, ACTIVITY_SEARCH)
+    and enforces document type candidate filtering rules.
     """
 
     KNOWN_ENTITIES = {
         "person": ["person", "people", "human", "pedestrian", "man", "woman", "guy", "individual", "suspect"],
         "car": ["car", "vehicle", "automobile", "sedan", "suv"],
         "truck": ["truck", "van", "lorry", "pickup"],
+        "bus": ["bus", "coach"],
         "bicycle": ["bicycle", "bike", "cyclist"],
         "motorcycle": ["motorcycle", "motorbike"],
         "backpack": ["backpack", "bag", "rucksack", "pack", "knapsack", "handbag", "luggage", "suitcase"]
@@ -28,12 +33,13 @@ class QueryIntentParser:
 
     ACTIVITY_KEYWORDS = [
         "activity", "movement", "motion", "busy period", "quiet period", "busy",
-        "quiet", "happened", "timeline", "chronological", "event", "events", "what happened"
+        "quiet", "happened", "timeline", "chronological", "event", "events", "what happened",
+        "unusual activity", "motion spike"
     ]
 
     @classmethod
     def parse_time_to_seconds(cls, time_str: str) -> Optional[float]:
-        """Converts MM:SS or H:MM:SS or HH:MM format into seconds."""
+        """Converts MM:SS or H:MM:SS format into total seconds."""
         time_str = time_str.strip().lower()
         parts = time_str.split(":")
         try:
@@ -50,16 +56,17 @@ class QueryIntentParser:
     @classmethod
     def parse_query(cls, query_text: str) -> Dict[str, Any]:
         """
-        Extracts structured intent parameters from natural language query.
+        Extracts structured intent parameters and candidate document type constraints from natural language query.
         """
         text_lower = query_text.lower().strip()
         intent: Dict[str, Any] = {
             "raw_query": query_text,
             "primary_entity": None,
+            "entities": [],
+            "objects": [],
             "required_entities": [],
             "clothing": [],
             "colors": [],
-            "objects": [],
             "track_id": None,
             "start_time": None,
             "end_time": None,
@@ -67,8 +74,8 @@ class QueryIntentParser:
             "spatial_target": None,
             "is_timeline_query": False,
             "is_activity_query": False,
-            "query_type": "GENERAL_SEMANTIC_QUERY",
-            "candidate_document_types": ["TRACK", "KEYFRAME", "SPATIAL_RELATION", "DETECTION_SUMMARY"],
+            "query_type": "OBJECT_SEARCH",
+            "candidate_document_types": ["TRACK", "KEYFRAME"],
             "required_evidence": []
         }
 
@@ -98,14 +105,14 @@ class QueryIntentParser:
         if before_match:
             intent["end_time"] = cls.parse_time_to_seconds(before_match.group(1))
 
-        # 3. Activity / Timeline Query Intent
+        # 3. Activity / Timeline Query Detection
         for kw in cls.ACTIVITY_KEYWORDS:
             if kw in text_lower:
                 intent["is_activity_query"] = True
                 if kw in ["what happened", "timeline", "chronological", "event", "events"]:
                     intent["is_timeline_query"] = True
 
-        # 4. Known Entity & Object Extraction
+        # 4. Entity & Object Extraction
         extracted_entities = []
         extracted_objects = []
         for category, keywords in cls.KNOWN_ENTITIES.items():
@@ -139,37 +146,50 @@ class QueryIntentParser:
                 intent["colors"].append(color)
 
         # 7. Spatial Relation Extraction
-        near_match = re.search(r"near\s+(?:the\s+)?(vehicle|car|truck|entrance|door|building|person|gate)", text_lower)
+        near_match = re.search(r"near\s+(?:the\s+)?(vehicle|car|truck|bus|entrance|door|building|person|gate)", text_lower)
         if near_match:
             intent["spatial_relation"] = "near"
             intent["spatial_target"] = near_match.group(1)
 
-        # 8. Determine Query Type & Candidate Document Types
-        if intent["track_id"] is not None and ("track" in text_lower or len(text_lower.split()) <= 4):
-            intent["query_type"] = "TRACK_QUERY"
+        # 8. Categorize Query into 6 Forensic Intent Types & Assign Candidate Document Types
+        if intent["track_id"] is not None:
+            intent["query_type"] = "TRACK_SEARCH"
             intent["candidate_document_types"] = ["TRACK"]
-            intent["required_evidence"] = ["PERSON_TRACK", "OBJECT_TRACK"]
+            intent["required_evidence"] = ["TRACK"]
 
-        elif intent["is_activity_query"] and not intent["primary_entity"] and not intent["clothing"]:
-            intent["query_type"] = "ACTIVITY_QUERY"
-            intent["candidate_document_types"] = [
-                "ACTIVITY_INTERVAL", "TIMELINE_EVENT", "SPATIAL_RELATION", "TRACK", "KEYFRAME"
-            ]
-            intent["required_evidence"] = ["ACTIVITY_INTERVAL", "TIMELINE_EVENT"]
+        elif intent["clothing"] or (intent["colors"] and intent["primary_entity"] == "person"):
+            intent["query_type"] = "ATTRIBUTE_SEARCH"
+            # EXCLUDE ACTIVITY_INTERVAL completely!
+            intent["candidate_document_types"] = ["TRACK", "KEYFRAME"]
+            intent["required_evidence"] = ["TRACK", "KEYFRAME", "VLM_OBSERVATION"]
 
-        elif intent["primary_entity"] == "person" or intent["clothing"] or "person" in text_lower or "people" in text_lower:
-            intent["query_type"] = "PERSON_CLOTHING_QUERY"
-            intent["candidate_document_types"] = ["TRACK", "KEYFRAME", "DETECTION_SUMMARY"]
-            intent["required_evidence"] = ["PERSON_TRACK", "KEYFRAME", "VLM_OBSERVATION", "VISUAL_ATTRIBUTE_OBSERVATION"]
+        elif intent["spatial_relation"] is not None or (len(intent["entities"]) >= 2):
+            intent["query_type"] = "RELATIONSHIP_SEARCH"
+            # EXCLUDE ACTIVITY_INTERVAL!
+            intent["candidate_document_types"] = ["SPATIAL_RELATION", "TRACK", "KEYFRAME"]
+            intent["required_evidence"] = ["SPATIAL_RELATION", "TRACK", "KEYFRAME"]
 
-        elif intent["objects"] or (intent["primary_entity"] and intent["primary_entity"] != "person"):
-            intent["query_type"] = "OBJECT_QUERY"
-            intent["candidate_document_types"] = ["TRACK", "KEYFRAME", "DETECTION_SUMMARY"]
-            intent["required_evidence"] = ["OBJECT_DETECTION", "KEYFRAME", "VLM_OBSERVATION"]
+        elif intent["is_activity_query"] or ("happened" in text_lower and not intent["primary_entity"]):
+            intent["query_type"] = "ACTIVITY_SEARCH"
+            intent["candidate_document_types"] = ["ACTIVITY_INTERVAL", "TRACK", "KEYFRAME", "SPATIAL_RELATION"]
+            intent["required_evidence"] = ["ACTIVITY_INTERVAL", "KEYFRAME"]
+
+        elif intent["start_time"] is not None or intent["end_time"] is not None:
+            intent["query_type"] = "TEMPORAL_SEARCH"
+            intent["candidate_document_types"] = ["ACTIVITY_INTERVAL", "TRACK", "KEYFRAME", "SPATIAL_RELATION"]
+            intent["required_evidence"] = ["TRACK", "KEYFRAME", "ACTIVITY_INTERVAL"]
 
         else:
-            intent["query_type"] = "GENERAL_SEMANTIC_QUERY"
-            intent["candidate_document_types"] = ["TRACK", "KEYFRAME", "SPATIAL_RELATION", "DETECTION_SUMMARY"]
-            intent["required_evidence"] = ["TRACK", "KEYFRAME", "VLM_OBSERVATION"]
+            intent["query_type"] = "OBJECT_SEARCH"
+            # EXCLUDE ACTIVITY_INTERVAL!
+            intent["candidate_document_types"] = ["TRACK", "KEYFRAME"]
+            intent["required_evidence"] = ["TRACK", "KEYFRAME"]
+
+        logger.info(
+            f"[INTENT] Parsed Query: '{query_text}' -> Type: {intent['query_type']} | "
+            f"Primary Entity: {intent['primary_entity']} | Entities: {intent['entities']} | "
+            f"Colors: {intent['colors']} | Clothing: {intent['clothing']} | Track: {intent['track_id']} | "
+            f"Allowed Doc Types: {intent['candidate_document_types']}"
+        )
 
         return intent

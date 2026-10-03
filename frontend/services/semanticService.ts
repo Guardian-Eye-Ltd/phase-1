@@ -85,6 +85,19 @@ export interface EnhancedTimelineResponse {
     timeline: EnhancedTimelineEvent[];
 }
 
+export interface AgentInvestigationResponse {
+    investigation_id: string;
+    evidence_id: number;
+    query: string;
+    status: string;
+    execution_time_ms: number;
+    plan: Record<string, any>;
+    progress: Array<{ stage: string; status: string; message: string }>;
+    events: Array<Record<string, any>>;
+    findings: SearchResultItem[];
+    report_markdown: string;
+}
+
 export const semanticService = {
     triggerIndexing: async (evidenceId: number): Promise<SemanticStatus> => {
         const res = await apiClient.post(`/evidence/${evidenceId}/semantic-index`, {});
@@ -100,6 +113,14 @@ export const semanticService = {
         const res = await apiClient.post(`/evidence/${evidenceId}/search`, {
             query,
             top_k: topK
+        });
+        return res.data;
+    },
+
+    executeAgentInvestigation: async (evidenceId: number, query: string): Promise<AgentInvestigationResponse> => {
+        const res = await apiClient.post(`/investigation/query`, {
+            evidence_id: evidenceId,
+            query
         });
         return res.data;
     },

@@ -22,6 +22,8 @@ export const VideoOverlayPlayer = forwardRef<VideoOverlayPlayerRef, VideoOverlay
         const [currentTime, setCurrentTime] = useState(0);
         const [duration, setDuration] = useState(0);
         const [overlayEnabled, setOverlayEnabled] = useState(true);
+        const [showTrackIds, setShowTrackIds] = useState(true);
+        const [showConfidence, setShowConfidence] = useState(true);
         const [videoError, setVideoError] = useState<string | null>(null);
 
         // Expose seekTo function to parent
@@ -75,9 +77,15 @@ export const VideoOverlayPlayer = forwardRef<VideoOverlayPlayerRef, VideoOverlay
                             ctx.strokeRect(x1, y1, w, h);
                             ctx.fillRect(x1, y1, w, h);
 
-                            // Draw Label Tag
-                            const trackLabel = det.track_id ? `#${det.track_id}` : "";
-                            const labelText = `${det.class_name} ${trackLabel} (${Math.round(det.confidence * 100)}%)`;
+                            // Construct Label Tag
+                            const parts = [det.class_name];
+                            if (showTrackIds && det.track_id) {
+                                parts.push(`Track #${det.track_id}`);
+                            }
+                            if (showConfidence) {
+                                parts.push(`${Math.round(det.confidence * 100)}%`);
+                            }
+                            const labelText = parts.join(" | ");
 
                             ctx.font = "bold 11px Inter, sans-serif";
                             const textWidth = ctx.measureText(labelText).width;
@@ -96,7 +104,7 @@ export const VideoOverlayPlayer = forwardRef<VideoOverlayPlayerRef, VideoOverlay
 
             animationFrameId = requestAnimationFrame(renderOverlay);
             return () => cancelAnimationFrame(animationFrameId);
-        }, [detections, overlayEnabled]);
+        }, [detections, overlayEnabled, showTrackIds, showConfidence]);
 
         const togglePlay = () => {
             if (videoRef.current) {
@@ -200,17 +208,41 @@ export const VideoOverlayPlayer = forwardRef<VideoOverlayPlayerRef, VideoOverlay
                         className="absolute inset-0 w-full h-full pointer-events-none"
                     />
 
-                    {/* Overlay Toggle Badge */}
-                    <button
-                        onClick={() => setOverlayEnabled(!overlayEnabled)}
-                        className={`absolute top-3 right-3 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 border backdrop-blur-md transition-all ${overlayEnabled
-                            ? "border-cyan-400 bg-cyan-950/80 text-cyan-300 shadow-md shadow-cyan-950/80"
-                            : "border-slate-800 bg-slate-900/80 text-slate-400"
-                            }`}
-                    >
-                        {overlayEnabled ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5" />}
-                        {overlayEnabled ? "AI Bounding Box Overlay Active" : "Overlay Disabled"}
-                    </button>
+                    {/* Overlay Toggle Badges & Layer Controls */}
+                    <div className="absolute top-3 right-3 flex items-center gap-2">
+                        <button
+                            onClick={() => setOverlayEnabled(!overlayEnabled)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border backdrop-blur-md transition-all ${overlayEnabled
+                                ? "border-cyan-400 bg-cyan-950/80 text-cyan-300 shadow-md shadow-cyan-950/80"
+                                : "border-slate-800 bg-slate-900/80 text-slate-400"
+                                }`}
+                        >
+                            {overlayEnabled ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5" />}
+                            {overlayEnabled ? "Detections ON" : "Detections OFF"}
+                        </button>
+                        {overlayEnabled && (
+                            <>
+                                <button
+                                    onClick={() => setShowTrackIds(!showTrackIds)}
+                                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border backdrop-blur-md transition-all ${showTrackIds
+                                        ? "border-cyan-500/40 bg-cyan-950/60 text-cyan-300"
+                                        : "border-slate-800 bg-slate-900/60 text-slate-500"
+                                        }`}
+                                >
+                                    Track IDs
+                                </button>
+                                <button
+                                    onClick={() => setShowConfidence(!showConfidence)}
+                                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border backdrop-blur-md transition-all ${showConfidence
+                                        ? "border-emerald-500/40 bg-emerald-950/60 text-emerald-300"
+                                        : "border-slate-800 bg-slate-900/60 text-slate-500"
+                                        }`}
+                                >
+                                    Confidence
+                                </button>
+                            </>
+                        )}
+                    </div>
                 </div>
 
                 {/* Custom Video Controls Bar */}

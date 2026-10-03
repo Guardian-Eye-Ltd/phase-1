@@ -143,6 +143,54 @@ async def cancel_analysis_job(
 
     return {"message": "Job cancellation requested", "job_id": job_id}
 
+async def _get_latest_job_for_evidence(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
+    """Helper to fetch the latest completed or processing AnalysisJob for an evidence file."""
+    res = await db.execute(
+        select(AnalysisJob)
+        .where(AnalysisJob.evidence_id == evidence_id)
+        .order_by(desc(AnalysisJob.created_at))
+    )
+    return res.scalars().first()
+
+@router.post("/{evidence_id}/reset-analysis", status_code=status.HTTP_200_OK)
+async def reset_evidence_analysis(
+    evidence_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Deletes all derived analysis jobs, detections, tracks, keyframes, and events for an evidence file.
+    Leaves original video file intact for testing re-runs.
+    """
+    from sqlalchemy import delete
+    ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
+    evidence = ev_res.scalar_one_or_none()
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    await db.execute(delete(Detection).where(Detection.evidence_id == evidence_id))
+    await db.execute(delete(Track).where(Track.evidence_id == evidence_id))
+    await db.execute(delete(Keyframe).where(Keyframe.evidence_id == evidence_id))
+    await db.execute(delete(ActivityInterval).where(ActivityInterval.evidence_id == evidence_id))
+    await db.execute(delete(PossibleInteraction).where(PossibleInteraction.evidence_id == evidence_id))
+    await db.execute(delete(FrameObservation).where(FrameObservation.evidence_id == evidence_id))
+    await db.execute(delete(AnalysisJob).where(AnalysisJob.evidence_id == evidence_id))
+    
+    evidence.status = EvidenceStatus.UNPROCESSED
+    await db.commit()
+
+    audit = AuditLog(
+        user_id=current_user.id,
+        action="ANALYSIS_RESET",
+        resource_type="EVIDENCE",
+        resource_id=str(evidence_id),
+        metadata_json=f"Reset derived analysis data for evidence #{evidence_id}"
+    )
+    db.add(audit)
+    await db.commit()
+
+    return {"message": f"Successfully reset analysis state for evidence #{evidence_id}", "evidence_id": evidence_id}
+
 @router.get("/{evidence_id}/detections")
 async def get_evidence_detections(
     evidence_id: int,
@@ -154,9 +202,13 @@ async def get_evidence_detections(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves paginated object and person detections for an evidence file.
+    Retrieves paginated object and person detections for the latest analysis job of an evidence file.
     """
-    query = select(Detection).where(Detection.evidence_id == evidence_id)
+    job = await _get_latest_job_for_evidence(evidence_id, db)
+    if not job:
+        return []
+
+    query = select(Detection).where(Detection.analysis_job_id == job.id)
     if class_name:
         query = query.where(Detection.class_name == class_name.lower())
     if track_id:
@@ -187,9 +239,13 @@ async def get_evidence_tracks(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves tracked entity summaries (persons, vehicles, objects) for an evidence file.
+    Retrieves tracked entity summaries for the latest analysis job of an evidence file.
     """
-    query = select(Track).where(Track.evidence_id == evidence_id)
+    job = await _get_latest_job_for_evidence(evidence_id, db)
+    if not job:
+        return []
+
+    query = select(Track).where(Track.analysis_job_id == job.id)
     if class_name:
         query = query.where(Track.class_name == class_name.lower())
 
@@ -219,11 +275,15 @@ async def get_evidence_keyframes(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves extracted forensic keyframe images with selection reasons and cryptographic SHA-256 hashes.
+    Retrieves extracted forensic keyframe images for the latest analysis job.
     """
+    job = await _get_latest_job_for_evidence(evidence_id, db)
+    if not job:
+        return []
+
     res = await db.execute(
         select(Keyframe)
-        .where(Keyframe.evidence_id == evidence_id)
+        .where(Keyframe.analysis_job_id == job.id)
         .order_by(Keyframe.timestamp.asc())
     )
     keyframes = res.scalars().all()
@@ -248,11 +308,15 @@ async def get_evidence_activity_intervals(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves motion activity intervals (LOW ACTIVITY vs HIGH ACTIVITY) across video timeline.
+    Retrieves motion activity intervals for the latest analysis job.
     """
+    job = await _get_latest_job_for_evidence(evidence_id, db)
+    if not job:
+        return []
+
     res = await db.execute(
         select(ActivityInterval)
-        .where(ActivityInterval.evidence_id == evidence_id)
+        .where(ActivityInterval.analysis_job_id == job.id)
         .order_by(ActivityInterval.start_time.asc())
     )
     intervals = res.scalars().all()
@@ -277,21 +341,23 @@ async def get_evidence_timeline(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves unified chronological forensic observations timeline.
+    Retrieves unified chronological forensic observations timeline for the latest analysis job.
     """
-    # Fetch tracks, keyframes, and interactions
-    tr_res = await db.execute(select(Track).where(Track.evidence_id == evidence_id))
+    job = await _get_latest_job_for_evidence(evidence_id, db)
+    if not job:
+        return []
+
+    tr_res = await db.execute(select(Track).where(Track.analysis_job_id == job.id))
     tracks = tr_res.scalars().all()
 
-    kf_res = await db.execute(select(Keyframe).where(Keyframe.evidence_id == evidence_id))
+    kf_res = await db.execute(select(Keyframe).where(Keyframe.analysis_job_id == job.id))
     keyframes = kf_res.scalars().all()
 
-    in_res = await db.execute(select(PossibleInteraction).where(PossibleInteraction.evidence_id == evidence_id))
+    in_res = await db.execute(select(PossibleInteraction).where(PossibleInteraction.analysis_job_id == job.id))
     interactions = in_res.scalars().all()
 
     timeline_events = []
 
-    # Track appearance events
     for t in tracks:
         label_str = "Person" if t.class_name == "person" else t.class_name.capitalize()
         timeline_events.append({
@@ -304,19 +370,17 @@ async def get_evidence_timeline(
             "class_name": t.class_name
         })
 
-    # Keyframe selection events
     for k in keyframes:
         timeline_events.append({
             "timestamp": k.timestamp,
             "frame_number": k.frame_number,
             "type": "KEYFRAME_SELECTED",
-            "title": f"Keyframe #{k.frame_number} ({k.selection_reason.replace('_', ' ')})",
+            "title": f"Keyframe #{k.frame_number} ({k.selection_reason.value.replace('_', ' ')})",
             "description": f"Selected at {k.timestamp:.2f}s. Image Hash: {k.sha256_hash[:8]}...",
             "image_path": k.image_path,
             "sha256_hash": k.sha256_hash
         })
 
-    # Spatial Interaction events
     for inter in interactions:
         timeline_events.append({
             "timestamp": inter.start_time,
@@ -328,7 +392,6 @@ async def get_evidence_timeline(
             "confidence": inter.confidence_score
         })
 
-    # Sort chronologically by timestamp
     timeline_events.sort(key=lambda x: x["timestamp"])
     return timeline_events
 
@@ -341,19 +404,14 @@ async def get_evidence_manifest(
     """
     Retrieves the machine-readable cryptographic analysis manifest for evidence provenance verification.
     """
-    job_res = await db.execute(
-        select(AnalysisJob)
-        .where(AnalysisJob.evidence_id == evidence_id)
-        .order_by(desc(AnalysisJob.created_at))
-    )
-    job = job_res.scalars().first()
+    job = await _get_latest_job_for_evidence(evidence_id, db)
     if not job:
-        raise HTTPException(status_code=404, detail="No completed analysis job found for evidence")
+        raise HTTPException(status_code=404, detail="No analysis job found for evidence")
 
     ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
     evidence = ev_res.scalar_one_or_none()
 
-    kf_res = await db.execute(select(Keyframe).where(Keyframe.evidence_id == evidence_id))
+    kf_res = await db.execute(select(Keyframe).where(Keyframe.analysis_job_id == job.id))
     keyframes = kf_res.scalars().all()
 
     kf_dicts = [
@@ -367,10 +425,48 @@ async def get_evidence_manifest(
         for k in keyframes
     ]
 
+    det_res = await db.execute(select(Detection).where(Detection.analysis_job_id == job.id))
+    detections = det_res.scalars().all()
+    det_dicts = [
+        {
+            "frame_number": d.frame_number,
+            "timestamp": d.timestamp,
+            "class_name": d.class_name,
+            "confidence": d.confidence,
+            "bbox_x1": d.bbox_x1,
+            "bbox_y1": d.bbox_y1,
+            "bbox_x2": d.bbox_x2,
+            "bbox_y2": d.bbox_y2,
+            "track_id": d.track_id
+        }
+        for d in detections
+    ]
+
+    trk_res = await db.execute(select(Track).where(Track.analysis_job_id == job.id))
+    tracks = trk_res.scalars().all()
+    trk_dicts = [
+        {
+            "track_number": t.track_number,
+            "class_name": t.class_name,
+            "first_seen_timestamp": t.first_seen_timestamp,
+            "last_seen_timestamp": t.last_seen_timestamp,
+            "duration": t.duration,
+            "observation_count": t.observation_count
+        }
+        for t in tracks
+    ]
+
+    obs_res = await db.execute(select(func.count(FrameObservation.id)).where(FrameObservation.analysis_job_id == job.id))
+    total_frames_sampled = obs_res.scalar() or 0
+
     stats = {
         "job_id": job.id,
         "status": job.status,
         "progress": job.progress,
+        "total_frames_sampled": total_frames_sampled,
+        "total_detections": len(detections),
+        "total_tracks": len(tracks),
+        "total_keyframes": len(keyframes),
         "manifest_hash": job.manifest_hash
     }
 
@@ -386,7 +482,9 @@ async def get_evidence_manifest(
         sampling_fps=job.sampling_fps,
         confidence_threshold=job.confidence_threshold,
         stats=stats,
-        keyframes=kf_dicts
+        keyframes=kf_dicts,
+        detections=det_dicts,
+        tracks=trk_dicts
     )
 
     return {
@@ -402,7 +500,6 @@ async def serve_derived_keyframe(
     """
     Serves derived keyframe thumbnail image files securely.
     """
-    # Prevent path traversal
     safe_filename = os.path.basename(filename)
     file_path = os.path.join(settings.DERIVED_STORAGE_DIR, "keyframes", str(evidence_id), safe_filename)
 

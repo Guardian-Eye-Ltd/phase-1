@@ -25,6 +25,8 @@ class VideoValidator:
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+        codec = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)]).strip() or "mp4v"
         cap.release()
 
         if frame_count <= 0:
@@ -40,5 +42,6 @@ class VideoValidator:
             "fps": calc_fps,
             "frame_count": frame_count,
             "duration": round(duration, 2),
+            "codec": codec,
             "file_size": os.path.getsize(file_path)
         }

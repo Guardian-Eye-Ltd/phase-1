@@ -175,7 +175,16 @@ class VectorService:
         if evidence_id is not None:
             stmt = stmt.where(ForensicDocument.evidence_id == evidence_id)
         if "document_types" in filters and filters["document_types"]:
-            stmt = stmt.where(ForensicDocument.document_type.in_(filters["document_types"]))
+            # Convert string values to DocumentType Enum instances for proper SQLAlchemy filtering
+            from app.models.semantic import DocumentType as DT
+            enum_types = []
+            for dt_str in filters["document_types"]:
+                try:
+                    enum_types.append(DT(dt_str) if isinstance(dt_str, str) else dt_str)
+                except (ValueError, KeyError):
+                    pass
+            if enum_types:
+                stmt = stmt.where(ForensicDocument.document_type.in_(enum_types))
         if "track_id" in filters and filters["track_id"] is not None:
             stmt = stmt.where(ForensicDocument.track_id == filters["track_id"])
         if "start_time" in filters and filters["start_time"] is not None:
@@ -194,13 +203,26 @@ class VectorService:
         # 2. ChromaDB search if available
         if cls._engine_type == "chromadb" and cls._chroma_collection is not None:
             try:
-                where_clause = {}
+                where_clauses = []
                 if evidence_id is not None:
-                    where_clause["evidence_id"] = int(evidence_id)
+                    where_clauses.append({"evidence_id": int(evidence_id)})
                 if "track_id" in filters and filters["track_id"] is not None:
-                    where_clause["track_id"] = int(filters["track_id"])
+                    where_clauses.append({"track_id": int(filters["track_id"])})
+                if "document_types" in filters and filters["document_types"]:
+                    dt_list = [str(dt) for dt in filters["document_types"]]
+                    if len(dt_list) == 1:
+                        where_clauses.append({"document_type": dt_list[0]})
+                    else:
+                        where_clauses.append({"document_type": {"$in": dt_list}})
 
-                query_params = {"query_texts": [query_text], "n_results": min(top_k * 2, len(documents))}
+                # Build final where clause with $and if multiple conditions
+                where_clause = None
+                if len(where_clauses) == 1:
+                    where_clause = where_clauses[0]
+                elif len(where_clauses) > 1:
+                    where_clause = {"$and": where_clauses}
+
+                query_params = {"query_texts": [query_text], "n_results": min(top_k * 2, max(len(documents), 1))}
                 if where_clause:
                     query_params["where"] = where_clause
 
@@ -226,12 +248,23 @@ class VectorService:
             except Exception as e:
                 logger.warning(f"ChromaDB search query error: {e}. Falling back to term similarity search.")
 
-        # 3. Fallback TF-IDF + Term Cosine Similarity calculation
+        # 3. Fallback TF-IDF + Term Cosine Similarity calculation with Synonym & Stem Matching
         STOP_WORDS = {
             "find", "show", "me", "a", "an", "the", "in", "on", "at", "with", "carrying",
             "wearing", "near", "is", "was", "are", "were", "of", "to", "for", "and", "or",
             "some", "any", "all", "around", "about", "between", "what", "happened"
         }
+        SYNONYMS = {
+            "people": ["person", "people", "human", "pedestrian", "man", "woman", "guy", "suspect"],
+            "person": ["person", "people", "human", "pedestrian"],
+            "cars": ["car", "cars", "vehicle", "automobile", "sedan"],
+            "car": ["car", "cars", "vehicle", "automobile"],
+            "vehicles": ["car", "vehicle", "truck", "bus", "automobile"],
+            "trucks": ["truck", "van", "pickup"],
+            "bags": ["bag", "backpack", "handbag", "luggage"],
+            "backpacks": ["backpack", "bag", "rucksack"]
+        }
+
         all_query_tokens = cls._tokenize(query_text)
         content_query_tokens = [tok for tok in all_query_tokens if tok not in STOP_WORDS]
         if not content_query_tokens:
@@ -248,9 +281,14 @@ class VectorService:
             d_vec = cls._compute_tf_idf_vector(doc_text, vocab)
             sim = cls._cosine_similarity(q_vec, d_vec)
             
-            # Boost similarity if query content keywords appear directly in title or content
+            # Boost similarity if query content keywords or synonyms appear in title/content
             text_lower = doc_text.lower()
-            token_matches = sum(1 for tok in content_query_tokens if tok in text_lower)
+            token_matches = 0
+            for tok in content_query_tokens:
+                syn_list = SYNONYMS.get(tok, [tok, tok.rstrip("s")])
+                if any(syn in text_lower for syn in syn_list if syn):
+                    token_matches += 1
+
             if content_query_tokens:
                 keyword_boost = 0.45 * (token_matches / len(content_query_tokens))
                 sim = min(1.0, sim + keyword_boost)

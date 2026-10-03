@@ -8,7 +8,7 @@ const apiClient = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
-  timeout: 10000, // 10s request timeout limit
+  timeout: 60000, // 60s request timeout limit for forensic AI analysis
 });
 
 apiClient.interceptors.request.use(
@@ -31,25 +31,25 @@ apiClient.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config;
-    
+
     // If error is 401 and we haven't already retried this request
     if (error.response && error.response.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
-      
+
       if (typeof window !== "undefined") {
         const refreshToken = localStorage.getItem("refresh_token");
-        
+
         if (refreshToken) {
           try {
             // Attempt to refresh the token
             const response = await axios.post(`${API_URL}/auth/refresh`, {
               refresh_token: refreshToken
             });
-            
+
             if (response.data && response.data.access_token) {
               // Store new tokens
               localStorage.setItem("access_token", response.data.access_token);
-              
+
               // Retry the original request
               originalRequest.headers.Authorization = `Bearer ${response.data.access_token}`;
               return apiClient(originalRequest);

@@ -125,6 +125,10 @@ async def search_evidence(
     """
     Executes natural language semantic forensic search grounded strictly in evidence observations.
     """
+    # Validate query is not empty or whitespace
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+
     ev_res = await db.execute(select(Evidence).where(Evidence.id == id))
     if not ev_res.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Evidence not found.")

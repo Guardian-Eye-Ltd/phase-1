@@ -1,8 +1,9 @@
 import logging
 import asyncio
+import time
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.database.session import SessionLocal
 from app.models.analysis import (
     AnalysisJob, JobStatus, JobStage, ActivityInterval,
@@ -18,7 +19,9 @@ from app.services.pipeline.object_detector import ObjectDetector
 from app.services.pipeline.multi_object_tracker import MultiObjectTracker
 from app.services.pipeline.keyframe_extractor import KeyframeExtractor
 from app.services.pipeline.interaction_detector import InteractionDetector
+from app.services.pipeline.event_engine import EventEngine
 from app.services.pipeline.manifest_generator import ManifestGenerator
+from app.services.semantic.indexer import SemanticIndexer
 
 logger = logging.getLogger(__name__)
 
@@ -27,19 +30,22 @@ active_job_cancellations = set()
 
 async def run_analysis_job_async(job_id: int):
     """
-    Background worker orchestrating the full Phase 1B computer vision pipeline.
+    Background worker orchestrating the full Phase 1B computer vision pipeline
+    and Phase 1C automatic evidence-grounded semantic indexing.
     """
+    start_perf_time = time.time()
+
     async with SessionLocal() as db:
         result = await db.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))
         job = result.scalar_one_or_none()
         if not job:
-            logger.error(f"Analysis job {job_id} not found.")
+            logger.error(f"[VIDEO] Analysis job {job_id} not found.")
             return
 
         evidence_res = await db.execute(select(Evidence).where(Evidence.id == job.evidence_id))
         evidence = evidence_res.scalar_one_or_none()
         if not evidence:
-            logger.error(f"Evidence {job.evidence_id} not found for job {job_id}.")
+            logger.error(f"[VIDEO] Evidence {job.evidence_id} not found for job {job_id}.")
             job.status = JobStatus.FAILED
             job.error_message = "Evidence record not found."
             await db.commit()
@@ -50,6 +56,14 @@ async def run_analysis_job_async(job_id: int):
         job.progress = 5.0
         job.current_stage = JobStage.VALIDATING
         evidence.status = EvidenceStatus.PROCESSING
+
+        # Clean up any existing records for this job ID to guarantee zero duplicates
+        await db.execute(delete(Detection).where(Detection.analysis_job_id == job.id))
+        await db.execute(delete(Track).where(Track.analysis_job_id == job.id))
+        await db.execute(delete(Keyframe).where(Keyframe.analysis_job_id == job.id))
+        await db.execute(delete(ActivityInterval).where(ActivityInterval.analysis_job_id == job.id))
+        await db.execute(delete(PossibleInteraction).where(PossibleInteraction.analysis_job_id == job.id))
+        await db.execute(delete(FrameObservation).where(FrameObservation.analysis_job_id == job.id))
         await db.commit()
 
         try:
@@ -57,6 +71,7 @@ async def run_analysis_job_async(job_id: int):
             if job_id in active_job_cancellations:
                 raise asyncio.CancelledError("Job cancelled by user.")
 
+            logger.info(f"[VIDEO] Validating video evidence file: {evidence.file_path}")
             video_info = VideoValidator.validate_video(evidence.file_path)
             
             # Stage 2: Extracting Metadata
@@ -67,6 +82,12 @@ async def run_analysis_job_async(job_id: int):
             evidence.fps = video_info["fps"]
             await db.commit()
 
+            logger.info(
+                f"[VIDEO] Metadata Extracted — Duration: {video_info['duration']}s, "
+                f"FPS: {video_info['fps']}, Resolution: {video_info['width']}x{video_info['height']}, "
+                f"Frames: {video_info['frame_count']}, Codec: {video_info.get('codec', 'N/A')}"
+            )
+
             # Stage 3: Frame Sampling
             if job_id in active_job_cancellations:
                 raise asyncio.CancelledError("Job cancelled by user.")
@@ -75,6 +96,7 @@ async def run_analysis_job_async(job_id: int):
             job.progress = 25.0
             await db.commit()
 
+            logger.info(f"[FRAME] Sampling video at {job.sampling_fps} FPS...")
             sampled_frames = list(FrameSampler.sample_frames(
                 evidence.file_path, 
                 target_fps=job.sampling_fps
@@ -89,6 +111,8 @@ async def run_analysis_job_async(job_id: int):
                 )
                 db.add(frame_obs)
             await db.commit()
+
+            logger.info(f"[FRAME] Sampled {len(sampled_frames)} frames out of {video_info['frame_count']} total video frames.")
 
             # Stage 4: Motion Analysis
             if job_id in active_job_cancellations:
@@ -123,13 +147,12 @@ async def run_analysis_job_async(job_id: int):
 
             detector = ObjectDetector(
                 model_name=job.model_name,
-                confidence_threshold=job.confidence_threshold
+                confidence_threshold=job.confidence_threshold,
+                iou_threshold=settings.DETECTION_IOU_THRESHOLD,
+                max_processing_dim=settings.MAX_PROCESSING_RESOLUTION
             )
 
-            raw_detections = []
-            for fn, ts, frame in sampled_frames:
-                dets = detector.detect_frame(frame, fn, ts)
-                raw_detections.extend(dets)
+            raw_detections = detector.detect_batch(sampled_frames, batch_size=16)
 
             # Stage 6: Multi-Object Tracking
             if job_id in active_job_cancellations:
@@ -143,8 +166,12 @@ async def run_analysis_job_async(job_id: int):
             track_summaries = []
 
             if job.tracking_enabled and raw_detections:
-                tracker = MultiObjectTracker(iou_threshold=0.25)
-                # Group by frame and process
+                tracker = MultiObjectTracker(
+                    iou_threshold=settings.DETECTION_IOU_THRESHOLD,
+                    max_time_lost=3.0
+                )
+                
+                # Group by frame and process chronologically
                 by_frame = {}
                 for d in raw_detections:
                     fn = d["frame_number"]
@@ -238,16 +265,20 @@ async def run_analysis_job_async(job_id: int):
                 db.add(inter_obj)
             await db.commit()
 
-            # Stage 8: Finalizing & Manifest Generation
+            # Stage 8: Event Engine & Manifest Generation
             job.current_stage = JobStage.FINALIZING
             job.progress = 95.0
             await db.commit()
+
+            # Run deterministic event engine for loitering, proximity, and carried objects
+            detected_events = EventEngine.detect_events(track_summaries, final_detections)
 
             stats = {
                 "total_frames_sampled": len(sampled_frames),
                 "total_detections": len(final_detections),
                 "total_tracks": len(track_summaries),
                 "total_keyframes": len(keyframes_data),
+                "total_events": len(detected_events),
                 "total_interactions": len(interactions),
                 "total_activity_intervals": len(motion_intervals)
             }
@@ -264,7 +295,10 @@ async def run_analysis_job_async(job_id: int):
                 sampling_fps=job.sampling_fps,
                 confidence_threshold=job.confidence_threshold,
                 stats=stats,
-                keyframes=keyframes_data
+                keyframes=keyframes_data,
+                detections=final_detections,
+                tracks=track_summaries,
+                events=detected_events
             )
 
             job.manifest_hash = manifest_hash
@@ -283,17 +317,30 @@ async def run_analysis_job_async(job_id: int):
             )
             db.add(audit_log)
             await db.commit()
-            logger.info(f"Analysis job {job_id} successfully completed.")
+
+            total_proc_time = round(time.time() - start_perf_time, 2)
+            avg_proc_fps = round(video_info['frame_count'] / max(total_proc_time, 0.01), 2)
+
+            logger.info(
+                f"[VIDEO] Processing Performance Summary — Video: {evidence.original_filename} (ID: {evidence.id}) | "
+                f"Duration: {video_info['duration']}s | FPS: {video_info['fps']} | Total Frames: {video_info['frame_count']} | "
+                f"Sampled Frames: {len(sampled_frames)} | Detections: {len(final_detections)} | Tracks: {len(track_summaries)} | "
+                f"Keyframes: {len(keyframes_data)} | Processing Time: {total_proc_time}s | Processing Speed: {avg_proc_fps} FPS"
+            )
+
+            # Automatic Evidence-Grounded Semantic Indexing
+            logger.info(f"[EMBEDDING] Auto-triggering semantic indexing for evidence {evidence.id}, job {job.id}...")
+            await SemanticIndexer.index_evidence_async(evidence.id, job.id)
 
         except asyncio.CancelledError:
-            logger.warning(f"Analysis job {job_id} was cancelled.")
+            logger.warning(f"[VIDEO] Analysis job {job_id} was cancelled.")
             job.status = JobStatus.CANCELLED
             job.error_message = "Analysis cancelled by investigator."
             evidence.status = EvidenceStatus.FAILED
             await db.commit()
 
         except Exception as e:
-            logger.exception(f"Error executing analysis job {job_id}: {e}")
+            logger.exception(f"[VIDEO] Error executing analysis job {job_id}: {e}")
             job.status = JobStatus.FAILED
             job.error_message = str(e)
             evidence.status = EvidenceStatus.FAILED

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -7,6 +7,8 @@ class SemanticIndexRequest(BaseModel):
     force_reindex: bool = False
 
 class SemanticStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     evidence_id: int
     status: str
     progress: float
@@ -60,6 +62,8 @@ class SearchResponse(BaseModel):
     results: List[SearchResultItemSchema]
 
 class ForensicDocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     evidence_id: int
     analysis_job_id: int
@@ -75,6 +79,8 @@ class ForensicDocumentResponse(BaseModel):
     created_at: datetime
 
 class VLMObservationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     evidence_id: int
     analysis_job_id: int
