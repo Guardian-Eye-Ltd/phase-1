@@ -4,11 +4,11 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, delete
 
 from app.database.session import get_db
 from app.models.user import User
-from app.models.evidence import Evidence
+from app.models.evidence import Evidence, EvidenceStatus
 from app.models.audit import AuditLog
 from app.models.analysis import (
     AnalysisJob, JobStatus, JobStage, ActivityInterval,
@@ -143,14 +143,24 @@ async def cancel_analysis_job(
 
     return {"message": "Job cancellation requested", "job_id": job_id}
 
-async def _get_latest_job_for_evidence(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
-    """Helper to fetch the latest completed or processing AnalysisJob for an evidence file."""
+async def _get_latest_completed_job(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
+    """
+    Returns the most recently COMPLETED AnalysisJob for an evidence file.
+    QUEUED, PROCESSING, FAILED, and CANCELLED jobs are intentionally excluded
+    so that prior good analysis data remains visible while a new job is running.
+    """
     res = await db.execute(
         select(AnalysisJob)
-        .where(AnalysisJob.evidence_id == evidence_id)
-        .order_by(desc(AnalysisJob.created_at))
+        .where(
+            AnalysisJob.evidence_id == evidence_id,
+            AnalysisJob.status == JobStatus.COMPLETED
+        )
+        .order_by(desc(AnalysisJob.completed_at))
     )
     return res.scalars().first()
+
+# Backward-compatible alias used by manifest route
+_get_latest_job_for_evidence = _get_latest_completed_job
 
 @router.post("/{evidence_id}/reset-analysis", status_code=status.HTTP_200_OK)
 async def reset_evidence_analysis(
@@ -162,7 +172,6 @@ async def reset_evidence_analysis(
     Deletes all derived analysis jobs, detections, tracks, keyframes, and events for an evidence file.
     Leaves original video file intact for testing re-runs.
     """
-    from sqlalchemy import delete
     ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
     evidence = ev_res.scalar_one_or_none()
     if not evidence:
@@ -175,8 +184,8 @@ async def reset_evidence_analysis(
     await db.execute(delete(PossibleInteraction).where(PossibleInteraction.evidence_id == evidence_id))
     await db.execute(delete(FrameObservation).where(FrameObservation.evidence_id == evidence_id))
     await db.execute(delete(AnalysisJob).where(AnalysisJob.evidence_id == evidence_id))
-    
-    evidence.status = EvidenceStatus.UNPROCESSED
+
+    evidence.status = EvidenceStatus.UPLOADED
     await db.commit()
 
     audit = AuditLog(
@@ -204,7 +213,7 @@ async def get_evidence_detections(
     """
     Retrieves paginated object and person detections for the latest analysis job of an evidence file.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
         return []
 
@@ -241,7 +250,7 @@ async def get_evidence_tracks(
     """
     Retrieves tracked entity summaries for the latest analysis job of an evidence file.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
         return []
 
@@ -277,7 +286,7 @@ async def get_evidence_keyframes(
     """
     Retrieves extracted forensic keyframe images for the latest analysis job.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
         return []
 
@@ -310,7 +319,7 @@ async def get_evidence_activity_intervals(
     """
     Retrieves motion activity intervals for the latest analysis job.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
         return []
 
@@ -343,7 +352,7 @@ async def get_evidence_timeline(
     """
     Retrieves unified chronological forensic observations timeline for the latest analysis job.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
         return []
 
@@ -404,9 +413,9 @@ async def get_evidence_manifest(
     """
     Retrieves the machine-readable cryptographic analysis manifest for evidence provenance verification.
     """
-    job = await _get_latest_job_for_evidence(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db)
     if not job:
-        raise HTTPException(status_code=404, detail="No analysis job found for evidence")
+        raise HTTPException(status_code=404, detail="No completed analysis job found for this evidence. Run analysis first.")
 
     ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
     evidence = ev_res.scalar_one_or_none()
@@ -459,14 +468,20 @@ async def get_evidence_manifest(
     obs_res = await db.execute(select(func.count(FrameObservation.id)).where(FrameObservation.analysis_job_id == job.id))
     total_frames_sampled = obs_res.scalar() or 0
 
+    act_res = await db.execute(select(func.count(ActivityInterval.id)).where(ActivityInterval.analysis_job_id == job.id))
+    total_activity_intervals = act_res.scalar() or 0
+
     stats = {
         "job_id": job.id,
         "status": job.status,
         "progress": job.progress,
-        "total_frames_sampled": total_frames_sampled,
+        "total_frames_sampled": job.frames_sampled or total_frames_sampled,
+        "frames_with_detections": job.frames_with_detections or 0,
+        "raw_detections": job.raw_detections or 0,
         "total_detections": len(detections),
         "total_tracks": len(tracks),
         "total_keyframes": len(keyframes),
+        "total_activity_intervals": total_activity_intervals,
         "manifest_hash": job.manifest_hash
     }
 

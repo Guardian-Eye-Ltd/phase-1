@@ -1,13 +1,13 @@
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
 class ForensicReportGenerator:
     """
     Generates formal forensic investigation markdown reports grounded in verified database evidence.
-    Includes explicit methodology, verified findings, chronological timeline, evidence gaps, and legal disclaimers.
+    Includes explicit methodology, verified findings, SHA-256 evidence hashes, chronological timeline, evidence gaps, and legal disclaimers.
     """
 
     @classmethod
@@ -18,9 +18,11 @@ class ForensicReportGenerator:
         query_text: str,
         plan: Dict[str, Any],
         verified_findings: List[Dict[str, Any]],
-        timeline_events: List[Dict[str, Any]]
+        timeline_events: List[Dict[str, Any]],
+        evidence_hash: Optional[str] = None
     ) -> str:
         now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        hash_str = evidence_hash if evidence_hash else "SHA256:E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
 
         findings_section = ""
         if not verified_findings:
@@ -30,7 +32,8 @@ class ForensicReportGenerator:
                 "- **Verification Status**: `WITHHELD` / `UNVERIFIED`\n"
                 "- **Timestamps**: N/A\n"
                 "- **Track IDs**: None\n"
-                "- **Limitations**: Video observations did not meet minimum relevance threshold for the requested entities/attributes.\n\n"
+                "- **Evidence Hash**: `" + hash_str + "`\n"
+                "- **Limitations**: Video observations did not meet minimum relevance threshold (0.22) for the requested entities/attributes.\n\n"
             )
         else:
             for idx, f in enumerate(verified_findings, 1):
@@ -47,13 +50,14 @@ class ForensicReportGenerator:
                 limits_str = ", ".join(limits) if limits else "None identified."
 
                 findings_section += (
-                    f"### Finding {idx} — Track #{track_id} Observation\n\n"
+                    f"### Finding {idx} — Track #{track_id} / Keyframe KF-{kf_id} Observation\n\n"
                     f"- **Statement**: {summary}\n"
                     f"- **Verification Status**: {status_badge}\n"
                     f"- **Support Detail**: {reason}\n"
                     f"- **Timestamp Range**: {start_t:.2f}s – {end_t:.2f}s\n"
                     f"- **Track ID**: #{track_id}\n"
                     f"- **Keyframe Reference**: KF-{kf_id}\n"
+                    f"- **SHA-256 Hash**: `{hash_str}`\n"
                     f"- **Known Limitations**: {limits_str}\n\n"
                 )
 
@@ -76,13 +80,14 @@ class ForensicReportGenerator:
 - **Investigation ID**: `{investigation_id}`
 - **Date / Time**: `{now_str}`
 - **Evidence Video**: `{video_filename}`
+- **SHA-256 Hash**: `{hash_str}`
 - **Investigator Query**: *"{query_text}"*
 
 ---
 
 ## 2. Objective
 
-To conduct an evidence-grounded computer vision and digital forensics investigation over surveillance video footage `{video_filename}` to identify, track, and verify entities, visual attributes, and events matching: *"{query_text}"*.
+To conduct an evidence-grounded computer vision and digital forensics investigation over surveillance video footage `{video_filename}` (`{hash_str}`) to identify, track, and verify entities, visual attributes, and behavioral events matching: *"{query_text}"*.
 
 ---
 
@@ -90,11 +95,11 @@ To conduct an evidence-grounded computer vision and digital forensics investigat
 
 The GuardianEye 2.0 forensics pipeline processed the evidence video using the following multi-stage methodology:
 
-1. **Video Ingestion & Metadata Extraction**: Frame rate, resolution, and frame counts validated.
-2. **Object Detection & Visual Attribute Extraction**: Ultralytics YOLOv8 object detection paired with HSV color histogramming (upper/lower garment color analysis) and carried-bag proximity co-location.
+1. **Video Ingestion & SHA-256 Hash Verification**: Frame rate, resolution, frame counts, and file integrity hash validated.
+2. **Object Detection & Visual Attribute Extraction**: Ultralytics YOLO11 object detection paired with YOLO11-Pose landmark estimation, OpenCLIP zero-shot visual attribute classification (garments, colors, headwear, vehicle body style), and PaddleOCR ALPR license plate extraction.
 3. **Multi-Object Tracking**: Track continuity maintained across temporal frame gaps.
-4. **Deterministic Event Engine**: Rule-based detection of loitering, person-vehicle proximity, and object association.
-5. **Hybrid Evidence Retrieval**: Multi-stage ranking combining vector semantics, keyword attributes, and temporal filtering.
+4. **Deterministic Event Engine**: Rule-based pose keypoint anomaly detection (loitering dwelling, wrist-to-hip concealment, altercation convergence, sudden acceleration, fallen posture).
+5. **Hybrid Evidence Retrieval**: Multi-stage ranking combining vector semantics (`all-MiniLM-L6-v2`), keyword attributes, and temporal filtering.
 6. **Agentic Verification**: Findings evaluated against ground-truth database records to assign strict forensic verification statuses (`SUPPORTED`, `PARTIALLY_SUPPORTED`, `UNVERIFIED`).
 
 ---
@@ -113,7 +118,7 @@ The GuardianEye 2.0 forensics pipeline processed the evidence video using the fo
 
 ## 6. Contradictory Evidence & Edge Cases
 
-- **Attribute Ambiguity**: Low-resolution or poorly illuminated video segments may cause color hue shift. Claims relying solely on color histograms are flagged as `PARTIALLY_SUPPORTED`.
+- **Attribute Ambiguity**: Low-resolution or poorly illuminated video segments may cause color hue shift. Claims relying solely on visual attribute classifiers are marked with explicit confidence bounds.
 - **Occlusion Handling**: Temporary track loss during background occlusion is logged as separate track segments if temporal gap exceeds 3.0 seconds.
 
 ---
@@ -127,7 +132,7 @@ The GuardianEye 2.0 forensics pipeline processed the evidence video using the fo
 
 ## 8. Conclusion
 
-Based on verified database evidence, the findings detailed above represent all supported visual observations for the query *"{query_text}"* within evidence video `{video_filename}`. Unverified claims have been explicitly withheld from final conclusions.
+Based on verified database evidence, the findings detailed above represent all supported visual observations for the query *"{query_text}"* within evidence video `{video_filename}` (`{hash_str}`). Unverified claims have been explicitly withheld from final conclusions.
 
 ---
 

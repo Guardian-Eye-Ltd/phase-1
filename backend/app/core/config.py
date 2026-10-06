@@ -38,12 +38,18 @@ class Settings(BaseSettings):
     FRAME_SAMPLE_FPS: float = 2.0
     DETECTION_INTERVAL: int = 1
     KEYFRAME_INTERVAL: float = 10.0
-    MAX_PROCESSING_RESOLUTION: int = 1920
-    YOLO_MODEL_NAME: str = "yolov8n.pt"
+    MAX_PROCESSING_RESOLUTION: int = 1280
+    YOLO_MODEL_NAME: str = "yolo11n.pt"
+    YOLO_POSE_MODEL_NAME: str = "yolo11n-pose.pt"
     DETECTION_CONFIDENCE_THRESHOLD: float = 0.25
     DETECTION_IOU_THRESHOLD: float = 0.45
 
-    # Phase 1C Semantic Intelligence Config
+    # CLIP Attribute Engine & ALPR Config
+    CLIP_MODEL_NAME: str = "openai/clip-vit-base-patch32"
+    ENABLE_ATTRIBUTE_CLASSIFICATION: bool = True
+    ENABLE_ALPR: bool = True
+
+    # Phase 1C Semantic Intelligence & Forensic Thresholds Config
     VLM_ENABLED: bool = True
     VLM_MODEL_NAME: str = "Salesforce/blip-image-captioning-base"
     MAX_KEYFRAMES_FOR_VLM: int = 30
@@ -54,7 +60,9 @@ class Settings(BaseSettings):
     VECTOR_DB_PATH: str = "storage/chroma_db"
     DEVICE: str = "cpu"
     EMBEDDING_BATCH_SIZE: int = 32
-    MIN_SEARCH_RELEVANCE: float = 0.40
+    MIN_SEARCH_RELEVANCE: float = 0.22
+    LOITERING_THRESHOLD_SECONDS: float = 12.0
+    CONCEALMENT_DISTANCE_THRESHOLD: float = 0.12  # Normalized keypoint wrist-to-hip distance
 
     # Agent & LLM Provider Config
     LLM_PROVIDER: str = "ollama"  # "ollama", "openai", "groq", "heuristics"

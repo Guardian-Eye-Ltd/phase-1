@@ -149,13 +149,20 @@ async def run_analysis_job_async(job_id: int):
             await db.commit()
 
             detector = ObjectDetector(
-                model_name=job.model_name,
+                model_name=settings.YOLO_MODEL_NAME,
                 confidence_threshold=job.confidence_threshold,
                 iou_threshold=settings.DETECTION_IOU_THRESHOLD,
                 max_processing_dim=settings.MAX_PROCESSING_RESOLUTION
             )
 
             raw_detections = detector.detect_batch(sampled_frames, batch_size=16)
+            # Count how many distinct frames had at least one detection
+            frames_with_dets = len(set(d["frame_number"] for d in raw_detections))
+            raw_detection_count = len(raw_detections)
+            logger.info(
+                f"[DETECTION] job={job_id} raw_detections={raw_detection_count} "
+                f"frames_with_detections={frames_with_dets}"
+            )
 
             # Stage 6: Multi-Object Tracking
             if job_id in active_job_cancellations:
@@ -280,8 +287,31 @@ async def run_analysis_job_async(job_id: int):
             # Run deterministic event engine for loitering, proximity, and carried objects
             detected_events = EventEngine.detect_events(track_summaries, final_detections)
 
+            # Write all pipeline diagnostic counters to the job record
+            job.frames_sampled = len(sampled_frames)
+            job.frames_with_detections = frames_with_dets
+            job.raw_detections = raw_detection_count
+            job.stored_detections = len(final_detections)
+            job.unique_tracks = len(track_summaries)
+            job.unique_keyframes = len(keyframes_data)
+            job.activity_intervals_count = len(motion_intervals)
+            job.tracker_algorithm = "IoU-Centroid-Custom"
+            job.model_name = settings.YOLO_MODEL_NAME
+            await db.commit()  # Commit diagnostic counters BEFORE reading stats
+
+            logger.info(
+                f"[PIPELINE] job={job_id} frames_sampled={len(sampled_frames)} "
+                f"frames_with_detections={frames_with_dets} "
+                f"raw_detections={raw_detection_count} stored_detections={len(final_detections)} "
+                f"tracks={len(track_summaries)} keyframes={len(keyframes_data)} "
+                f"events={len(detected_events)} motion_intervals={len(motion_intervals)}"
+            )
+
             stats = {
+                "job_id": job_id,
                 "total_frames_sampled": len(sampled_frames),
+                "frames_with_detections": frames_with_dets,
+                "raw_detections": raw_detection_count,
                 "total_detections": len(final_detections),
                 "total_tracks": len(track_summaries),
                 "total_keyframes": len(keyframes_data),

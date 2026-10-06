@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, BigInteger, Float, ForeignKey, DateTime, Text, Boolean, JSON, func, Enum
+from sqlalchemy import String, Integer, BigInteger, Float, ForeignKey, DateTime, Text, Boolean, JSON, func, Enum, UniqueConstraint
 from app.database.base import Base
 from datetime import datetime
 import enum
@@ -56,10 +56,20 @@ class AnalysisJob(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
     # Model provenance metadata
-    model_name: Mapped[str] = mapped_column(String(100), default="YOLOv8n", nullable=False)
-    model_version: Mapped[str] = mapped_column(String(50), default="8.2.0", nullable=False)
-    tracker_algorithm: Mapped[str] = mapped_column(String(50), default="ByteTrack", nullable=False)
+    model_name: Mapped[str] = mapped_column(String(100), default="yolo11n.pt", nullable=False)
+    model_version: Mapped[str] = mapped_column(String(50), default="11.0.0", nullable=False)
+    # Accurately reflects the custom IoU+centroid tracker — NOT ByteTrack
+    tracker_algorithm: Mapped[str] = mapped_column(String(50), default="IoU-Centroid-Custom", nullable=False)
     manifest_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Pipeline diagnostic counters — populated by analysis_runner at job completion
+    frames_sampled: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    frames_with_detections: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    raw_detections: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stored_detections: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unique_tracks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unique_keyframes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    activity_intervals_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
@@ -102,6 +112,10 @@ class FrameObservation(Base):
     sha256_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     analysis_job: Mapped["AnalysisJob"] = relationship(back_populates="frame_observations")
+
+    __table_args__ = (
+        UniqueConstraint("analysis_job_id", "frame_number", name="uq_job_frame_observation"),
+    )
 
 class Detection(Base):
     __tablename__ = "detections"
@@ -146,6 +160,10 @@ class Track(Base):
 
     analysis_job: Mapped["AnalysisJob"] = relationship(back_populates="tracks")
 
+    __table_args__ = (
+        UniqueConstraint("analysis_job_id", "track_number", name="uq_job_track_number"),
+    )
+
 class Keyframe(Base):
     __tablename__ = "keyframes"
 
@@ -164,6 +182,10 @@ class Keyframe(Base):
     detection_ids: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     analysis_job: Mapped["AnalysisJob"] = relationship(back_populates="keyframes")
+
+    __table_args__ = (
+        UniqueConstraint("analysis_job_id", "frame_number", name="uq_job_keyframe_frame"),
+    )
 
 class PossibleInteraction(Base):
     __tablename__ = "possible_interactions"

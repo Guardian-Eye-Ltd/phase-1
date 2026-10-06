@@ -1,90 +1,101 @@
 import cv2
 import numpy as np
+import torch
 import logging
-from typing import List, Dict, Any, Tuple
+from PIL import Image
+from typing import List, Dict, Any, Tuple, Optional
+from transformers import CLIPProcessor, CLIPModel
 from app.core.config import settings
+from app.services.pipeline.alpr_service import ALPRService
 
 logger = logging.getLogger(__name__)
 
-# COCO target classes for forensic surveillance
 TARGET_CLASSES = {
     "person", "car", "motorcycle", "bicycle", "bus", "truck",
-    "backpack", "handbag", "suitcase", "cell phone"
+    "backpack", "handbag", "suitcase"
 }
 
-_MODEL_CACHE: Dict[str, Any] = {}
+_DET_MODEL = None
+_POSE_MODEL = None
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
 
-def get_yolo_model(model_name: str):
-    """Loads and caches the YOLO model once in memory. Fails loudly on error."""
-    clean_name = model_name.strip().lower()
-    if not clean_name.endswith(".pt") and not clean_name.endswith(".yaml") and not clean_name.endswith(".onnx") and not clean_name.endswith(".engine"):
-        clean_name += ".pt"
+COLOR_LABELS = ["black", "white", "silver", "grey", "red", "blue", "green", "yellow", "brown"]
+HEADWEAR_LABELS = ["hat", "cap", "helmet", "bare head"]
+CARRIED_LABELS = ["backpack", "handbag", "suitcase", "box", "none"]
+VEHICLE_BODY_LABELS = ["sedan", "SUV", "pickup truck", "hatchback", "truck", "van", "motorcycle"]
+UPPER_GARMENT_LABELS = ["t-shirt", "jacket", "coat", "hoodie", "shirt", "sweater"]
+LOWER_GARMENT_LABELS = ["jeans", "pants", "shorts", "skirt"]
 
-    if model_name not in _MODEL_CACHE or _MODEL_CACHE[model_name] is None:
+def get_models():
+    """Lazily loads and caches YOLO detection, YOLO pose, and OpenCLIP models."""
+    global _DET_MODEL, _POSE_MODEL, _CLIP_MODEL, _CLIP_PROCESSOR
+    from ultralytics import YOLO
+    
+    if _DET_MODEL is None:
+        logger.info(f"[DETECTION] Loading YOLO detection model '{settings.YOLO_MODEL_NAME}' on device '{settings.DEVICE}'...")
+        _DET_MODEL = YOLO(settings.YOLO_MODEL_NAME)
+        
+    if _POSE_MODEL is None:
         try:
-            from ultralytics import YOLO
-            logger.info(f"[DETECTION] Loading YOLO model '{clean_name}' (requested: '{model_name}') on device '{settings.DEVICE}'...")
-            model = YOLO(clean_name)
-            # Warm-up pass to allocate CUDA/CPU graph
-            dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-            model.predict(dummy_frame, verbose=False, device=settings.DEVICE)
-            _MODEL_CACHE[model_name] = model
-            _MODEL_CACHE[clean_name] = model
-            logger.info(f"[DETECTION] Successfully loaded and cached YOLO model '{clean_name}'.")
+            logger.info(f"[POSE] Loading YOLO pose model '{settings.YOLO_POSE_MODEL_NAME}' on device '{settings.DEVICE}'...")
+            _POSE_MODEL = YOLO(settings.YOLO_POSE_MODEL_NAME)
         except Exception as e:
-            logger.critical(f"[DETECTION] FATAL: Failed to initialize YOLO model '{clean_name}': {e}", exc_info=True)
-            raise RuntimeError(f"YOLO model initialization failed for '{model_name}': {e}")
-    return _MODEL_CACHE[model_name]
+            logger.warning(f"[POSE] Pose model initialization warning ({e}). Proceeding without pose estimation.")
+            _POSE_MODEL = None
 
-def extract_dominant_color_hsv(crop: np.ndarray) -> str:
-    """Classifies dominant color using HSV thresholds."""
-    if crop is None or crop.size == 0:
-        return "unknown"
+    if _CLIP_MODEL is None and settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
+        try:
+            logger.info(f"[CLIP] Loading OpenCLIP model '{settings.CLIP_MODEL_NAME}' on device '{settings.DEVICE}'...")
+            _CLIP_MODEL = CLIPModel.from_pretrained(settings.CLIP_MODEL_NAME).to(settings.DEVICE)
+            _CLIP_PROCESSOR = CLIPProcessor.from_pretrained(settings.CLIP_MODEL_NAME)
+        except Exception as e:
+            logger.warning(f"[CLIP] OpenCLIP model initialization warning ({e}). Attribute classification will degrade safely.")
+            _CLIP_MODEL = None
+            _CLIP_PROCESSOR = None
+
+    return _DET_MODEL, _POSE_MODEL, _CLIP_MODEL, _CLIP_PROCESSOR
+
+def classify_crop_clip(crop_bgr: np.ndarray, labels: List[str]) -> Tuple[str, float]:
+    """Zero-shot neural classification over image crops using OpenCLIP."""
+    if crop_bgr is None or crop_bgr.size == 0 or not labels:
+        return "unknown", 0.0
     try:
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        
-        mean_v = float(np.mean(v))
-        mean_s = float(np.mean(s))
-        
-        if mean_v < 45:
-            return "black"
-        if mean_s < 30 and mean_v > 190:
-            return "white"
-        if mean_s < 35 and 45 <= mean_v <= 190:
-            return "grey"
-            
-        mean_h = float(np.mean(h))
-        if mean_h < 10 or mean_h > 170:
-            return "red"
-        elif 10 <= mean_h < 25:
-            return "brown" if mean_v < 120 else "orange"
-        elif 25 <= mean_h < 35:
-            return "yellow"
-        elif 35 <= mean_h < 85:
-            return "green"
-        elif 85 <= mean_h < 130:
-            return "blue"
-        elif 130 <= mean_h < 150:
-            return "purple"
-        elif 150 <= mean_h < 170:
-            return "pink"
-        return "dark" if mean_v < 100 else "light"
-    except Exception:
-        return "unknown"
+        _, _, clip_model, clip_proc = get_models()
+        if clip_model is None or clip_proc is None:
+            return "unknown", 0.0
 
-def enrich_detections_with_attributes(frame: np.ndarray, detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Enriches detected bounding boxes with HSV color attributes and bag proximity."""
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        
+        # Format labels into structured prompts for enhanced CLIP accuracy
+        text_prompts = [f"a photo of a {label}" for label in labels]
+        
+        inputs = clip_proc(text=text_prompts, images=pil_img, return_tensors="pt", padding=True).to(settings.DEVICE)
+        with torch.no_grad():
+            outputs = clip_model(**inputs)
+            probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
+            best_idx = int(np.argmax(probs))
+            return labels[best_idx], float(probs[best_idx])
+    except Exception as e:
+        logger.warning(f"[CLIP] Attribute inference error: {e}")
+        return "unknown", 0.0
+
+def enrich_detections_with_attributes(
+    frame: np.ndarray, 
+    detections: List[Dict[str, Any]],
+    pose_keypoints_by_box: Optional[Dict[int, np.ndarray]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Enriches detected bounding boxes with OpenCLIP fine-grained entity attributes,
+    PaddleOCR ALPR license plate extraction, and pose keypoint landmarks.
+    """
     if not detections or frame is None:
         return detections
 
     h, w = frame.shape[:2]
-    bag_boxes = [
-        d for d in detections 
-        if d["class_name"] in ["backpack", "handbag", "suitcase"]
-    ]
 
-    for det in detections:
+    for idx, det in enumerate(detections):
         x1 = max(0, int(det["bbox_x1"] * w))
         y1 = max(0, int(det["bbox_y1"] * h))
         x2 = min(w, int(det["bbox_x2"] * w))
@@ -93,32 +104,48 @@ def enrich_detections_with_attributes(frame: np.ndarray, detections: List[Dict[s
         crop_h = y2 - y1
         crop_w = x2 - x1
         
-        if crop_h > 10 and crop_w > 10:
+        if crop_h > 15 and crop_w > 15:
             crop = frame[y1:y2, x1:x2]
             
             if det["class_name"] == "person":
-                upper_crop = crop[int(crop_h * 0.15):int(crop_h * 0.55), :]
-                lower_crop = crop[int(crop_h * 0.55):int(crop_h * 0.95), :]
+                upper_crop = crop[int(crop_h * 0.10):int(crop_h * 0.50), :]
+                lower_crop = crop[int(crop_h * 0.50):int(crop_h * 0.90), :]
+                head_crop = crop[0:int(crop_h * 0.25), :]
                 
-                det["upper_garment_color"] = extract_dominant_color_hsv(upper_crop)
-                det["lower_garment_color"] = extract_dominant_color_hsv(lower_crop)
-                
-                # Check bag proximity association
-                cx = (det["bbox_x1"] + det["bbox_x2"]) / 2.0
-                cy = (det["bbox_y1"] + det["bbox_y2"]) / 2.0
-                
-                carries_bag = False
-                for bag in bag_boxes:
-                    bcx = (bag["bbox_x1"] + bag["bbox_x2"]) / 2.0
-                    bcy = (bag["bbox_y1"] + bag["bbox_y2"]) / 2.0
-                    if np.sqrt((cx - bcx)**2 + (cy - bcy)**2) < 0.20:
-                        carries_bag = True
-                        break
-                det["carries_bag"] = carries_bag
+                # Zero-shot OpenCLIP attribute classification
+                if settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
+                    upper_color, _ = classify_crop_clip(upper_crop, COLOR_LABELS)
+                    lower_color, _ = classify_crop_clip(lower_crop, COLOR_LABELS)
+                    upper_type, _ = classify_crop_clip(upper_crop, UPPER_GARMENT_LABELS)
+                    lower_type, _ = classify_crop_clip(lower_crop, LOWER_GARMENT_LABELS)
+                    headwear, _ = classify_crop_clip(head_crop, HEADWEAR_LABELS)
+                    carried_item, _ = classify_crop_clip(crop, CARRIED_LABELS)
+                    
+                    det["upper_garment_color"] = upper_color
+                    det["lower_garment_color"] = lower_color
+                    det["upper_garment_type"] = upper_type
+                    det["lower_garment_type"] = lower_type
+                    det["headwear"] = headwear
+                    det["carries_bag"] = carried_item in ["backpack", "handbag", "suitcase", "box"]
+                    det["carried_item"] = carried_item
+
+                # Attach Pose Keypoints if available
+                if pose_keypoints_by_box and idx in pose_keypoints_by_box:
+                    det["keypoints"] = pose_keypoints_by_box[idx].tolist()
                 
             elif det["class_name"] in ["car", "motorcycle", "bicycle", "bus", "truck"]:
-                det["vehicle_color"] = extract_dominant_color_hsv(crop)
-                
+                if settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
+                    v_color, _ = classify_crop_clip(crop, COLOR_LABELS)
+                    v_body, _ = classify_crop_clip(crop, VEHICLE_BODY_LABELS)
+                    det["vehicle_color"] = v_color
+                    det["vehicle_body_style"] = v_body
+
+                # ALPR License Plate Extraction via PaddleOCR / ALPRService
+                if settings.ENABLE_ALPR:
+                    plate_num = ALPRService.extract_license_plate(crop)
+                    if plate_num:
+                        det["license_plate_number"] = plate_num
+
     return detections
 
 class ObjectDetector:
@@ -133,7 +160,9 @@ class ObjectDetector:
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.max_processing_dim = max_processing_dim
-        self.yolo_model = get_yolo_model(self.model_name)
+        det_model, pose_model, _, _ = get_models()
+        self.yolo_model = det_model
+        self.pose_model = pose_model
 
     def preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, int, int]:
         orig_h, orig_w = frame.shape[:2]
@@ -170,6 +199,7 @@ class ObjectDetector:
                 processed_frames.append(p_frame)
                 frame_meta.append((fn, ts, orig_w, orig_h, frame))
 
+            # Run Primary Bounding Box Detection
             results = self.yolo_model.predict(
                 processed_frames,
                 conf=self.confidence_threshold,
@@ -178,10 +208,37 @@ class ObjectDetector:
                 verbose=False
             )
 
-            for result, (fn, ts, orig_w, orig_h, raw_frame) in zip(results, frame_meta):
+            # Optional Pose Estimation pass for keypoint extraction
+            pose_results = None
+            if self.pose_model is not None:
+                try:
+                    pose_results = self.pose_model.predict(
+                        processed_frames,
+                        conf=self.confidence_threshold,
+                        device=settings.DEVICE,
+                        verbose=False
+                    )
+                except Exception as pe:
+                    logger.warning(f"[POSE] Pose prediction pass skipped: {pe}")
+
+            for b_idx, (result, (fn, ts, orig_w, orig_h, raw_frame)) in enumerate(zip(results, frame_meta)):
                 boxes = result.boxes
                 p_h, p_w = result.orig_shape[:2]
                 frame_dets = []
+                pose_map: Dict[int, np.ndarray] = {}
+
+                # Match pose keypoints to person boxes in this frame
+                if pose_results and b_idx < len(pose_results):
+                    pose_res = pose_results[b_idx]
+                    if hasattr(pose_res, "keypoints") and pose_res.keypoints is not None:
+                        try:
+                            kp_data = pose_res.keypoints.xyn.cpu().numpy() # (N, 17, 2)
+                            for k_idx, kp in enumerate(kp_data):
+                                pose_map[k_idx] = kp
+                        except Exception:
+                            pass
+
+                person_det_counter = 0
 
                 for box in boxes:
                     cls_id = int(box.cls[0])
@@ -190,20 +247,41 @@ class ObjectDetector:
 
                     if cls_name in TARGET_CLASSES:
                         xyxy = box.xyxy[0].tolist()
-                        frame_dets.append({
+                        
+                        # Preserve forensic precision by mapping normalized coordinates
+                        # directly to original image dimensions
+                        orig_x1 = max(0.0, min(float(orig_w), (xyxy[0] / float(p_w)) * orig_w))
+                        orig_y1 = max(0.0, min(float(orig_h), (xyxy[1] / float(p_h)) * orig_h))
+                        orig_x2 = max(0.0, min(float(orig_w), (xyxy[2] / float(p_w)) * orig_w))
+                        orig_y2 = max(0.0, min(float(orig_h), (xyxy[3] / float(p_h)) * orig_h))
+
+                        det_entry = {
                             "frame_number": fn,
                             "timestamp": ts,
                             "class_name": cls_name,
                             "confidence": round(conf, 3),
-                            "bbox_x1": round(max(0.0, min(1.0, xyxy[0] / p_w)), 4),
-                            "bbox_y1": round(max(0.0, min(1.0, xyxy[1] / p_h)), 4),
-                            "bbox_x2": round(max(0.0, min(1.0, xyxy[2] / p_w)), 4),
-                            "bbox_y2": round(max(0.0, min(1.0, xyxy[3] / p_h)), 4),
+                            "bbox_x1": round(orig_x1 / float(orig_w), 4),
+                            "bbox_y1": round(orig_y1 / float(orig_h), 4),
+                            "bbox_x2": round(orig_x2 / float(orig_w), 4),
+                            "bbox_y2": round(orig_y2 / float(orig_h), 4),
                             "upper_garment_color": "unknown",
                             "lower_garment_color": "unknown",
+                            "upper_garment_type": "unknown",
+                            "lower_garment_type": "unknown",
+                            "headwear": "unknown",
                             "vehicle_color": "unknown",
-                            "carries_bag": False
-                        })
+                            "vehicle_body_style": "unknown",
+                            "license_plate_number": None,
+                            "carries_bag": False,
+                            "keypoints": None
+                        }
+
+                        if cls_name == "person":
+                            if person_det_counter in pose_map:
+                                det_entry["keypoints"] = pose_map[person_det_counter].tolist()
+                            person_det_counter += 1
+
+                        frame_dets.append(det_entry)
 
                 enriched = enrich_detections_with_attributes(raw_frame, frame_dets)
                 all_detections.extend(enriched)

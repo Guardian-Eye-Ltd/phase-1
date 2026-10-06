@@ -1,133 +1,277 @@
+import os
 import logging
 import asyncio
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
+from sentence_transformers import SentenceTransformer
+import chromadb
 
 from app.database.session import SessionLocal
 from app.models.analysis import AnalysisJob, JobStatus
-from app.models.semantic import ForensicDocument, AIModelExecution
+from app.models.semantic import ForensicDocument, EmbeddingRecord, VLMObservation
 from app.services.semantic.document_generator import ForensicDocumentGenerator
 from app.services.semantic.vlm_service import VisionLanguageService
-from app.services.semantic.vector_service import VectorService
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Memory status tracker for background indexing jobs
-active_indexing_jobs: Dict[int, Dict[str, Any]] = {}
+# In-memory indexing status tracking (keyed by evidence_id)
+_indexing_status: Dict[int, Dict[str, Any]] = {}
+
+# Lazy-loaded embedding model & Chroma client cache
+_EMBEDDING_MODEL = None
+_CHROMA_CLIENT = None
+
+
+def get_embedding_model():
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        logger.info(
+            f"[EMBEDDING] Loading sentence-transformer '{settings.EMBEDDING_MODEL_NAME}' "
+            f"on device '{settings.DEVICE}'..."
+        )
+        _EMBEDDING_MODEL = SentenceTransformer(settings.EMBEDDING_MODEL_NAME, device=settings.DEVICE)
+    return _EMBEDDING_MODEL
+
+
+def get_chroma_client():
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        os.makedirs(settings.VECTOR_DB_PATH, exist_ok=True)
+        _CHROMA_CLIENT = chromadb.PersistentClient(path=settings.VECTOR_DB_PATH)
+    return _CHROMA_CLIENT
+
+
+def _chroma_collection_name(evidence_id: int, analysis_job_id: int) -> str:
+    """
+    Returns a deterministic, job-scoped ChromaDB collection name.
+    Each analysis job gets its own isolated vector collection — no cross-job contamination.
+    """
+    return f"ev{evidence_id}_job{analysis_job_id}"
+
+
+async def _get_latest_completed_job_id(evidence_id: int, db: AsyncSession) -> Optional[int]:
+    """Fetch the analysis_job_id of the most recently completed job for this evidence."""
+    res = await db.execute(
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.evidence_id == evidence_id,
+            AnalysisJob.status == JobStatus.COMPLETED
+        )
+        .order_by(AnalysisJob.completed_at.desc())
+    )
+    job = res.scalars().first()
+    return job.id if job else None
+
 
 class SemanticIndexer:
-    """
-    Background Indexing Orchestrator managing document generation, VLM analysis,
-    and vector database embedding for evidence analysis jobs.
-    """
 
     @classmethod
     def get_indexing_status(cls, evidence_id: int) -> Dict[str, Any]:
-        """Returns the current background indexing status for evidence_id."""
-        return active_indexing_jobs.get(evidence_id, {
+        return _indexing_status.get(evidence_id, {
             "evidence_id": evidence_id,
             "status": "NOT_STARTED",
             "progress": 0.0,
             "stage": "IDLE",
-            "error": None
+            "total_documents": 0,
+            "total_vlm_observations": 0,
+            "total_embeddings": 0
         })
 
     @classmethod
     async def index_evidence_async(cls, evidence_id: int, analysis_job_id: int):
         """
-        Asynchronous worker executing the full Phase 1C indexing workflow:
-        Document Generation -> VLM Analysis -> Embedding & Vector Storage -> Verification.
+        Orchestrates document generation → sentence-transformer embedding → ChromaDB upsert.
+
+        ISOLATION GUARANTEE:
+        - Only ForensicDocuments and EmbeddingRecords for THIS analysis_job_id are deleted/recreated.
+        - Every prior job's documents remain intact in both the SQL DB and a separate ChromaDB collection.
+        - ChromaDB collection is named ev{evidence_id}_job{analysis_job_id} (per-job).
         """
-        active_indexing_jobs[evidence_id] = {
+        _indexing_status[evidence_id] = {
             "evidence_id": evidence_id,
             "analysis_job_id": analysis_job_id,
             "status": "PROCESSING",
             "progress": 10.0,
-            "stage": "GENERATING_FORENSIC_DOCUMENTS",
-            "error": None
+            "stage": "GENERATING_DOCUMENTS",
+            "total_documents": 0,
+            "total_vlm_observations": 0,
+            "total_embeddings": 0
         }
 
-        try:
-            async with SessionLocal() as db:
-                # Stage 0: Clean up any existing documents from prior indexing (idempotent re-index)
-                from app.models.semantic import EmbeddingRecord, VLMObservation
-                from sqlalchemy import delete
-                await db.execute(delete(EmbeddingRecord).where(EmbeddingRecord.evidence_id == evidence_id))
-                await db.execute(delete(VLMObservation).where(VLMObservation.evidence_id == evidence_id))
-                await db.execute(delete(ForensicDocument).where(ForensicDocument.evidence_id == evidence_id))
+        async with SessionLocal() as db:
+            try:
+                # 1. Clean up only THIS job's documents & VLM observations — other jobs are untouched
+                await db.execute(
+                    delete(EmbeddingRecord).where(
+                        EmbeddingRecord.evidence_id == evidence_id,
+                        EmbeddingRecord.analysis_job_id == analysis_job_id
+                    )
+                )
+                await db.execute(
+                    delete(ForensicDocument).where(
+                        ForensicDocument.evidence_id == evidence_id,
+                        ForensicDocument.analysis_job_id == analysis_job_id
+                    )
+                )
+                await db.execute(
+                    delete(VLMObservation).where(
+                        VLMObservation.evidence_id == evidence_id,
+                        VLMObservation.analysis_job_id == analysis_job_id
+                    )
+                )
                 await db.commit()
-                logger.info(f"Cleaned up prior semantic index data for evidence {evidence_id}.")
+                logger.info(
+                    f"[INDEXER] Cleared existing documents and VLM observations for evidence #{evidence_id}, "
+                    f"job #{analysis_job_id}. Other job documents preserved."
+                )
 
-                # Stage 1: Generate Forensic Documents from Phase 1B observations
-                logger.info(f"Generating ForensicDocuments for evidence {evidence_id}...")
+                # 2. Run Vision-Language analysis on forensic keyframes
+                vlm_obs_list = await VisionLanguageService.analyze_keyframes_for_job(
+                    db=db,
+                    evidence_id=evidence_id,
+                    analysis_job_id=analysis_job_id
+                )
+                total_vlm = len(vlm_obs_list) if vlm_obs_list else 0
+
+                # 2. Generate structured ForensicDocuments scoped to this job
                 docs = await ForensicDocumentGenerator.generate_documents_for_job(
                     db=db,
                     evidence_id=evidence_id,
                     analysis_job_id=analysis_job_id
                 )
 
-                active_indexing_jobs[evidence_id]["progress"] = 40.0
-                active_indexing_jobs[evidence_id]["stage"] = "VLM_KEYFRAME_ANALYSIS"
+                if not docs:
+                    logger.warning(
+                        f"[INDEXER] No documents generated for evidence #{evidence_id}, "
+                        f"job #{analysis_job_id}. Pipeline may have produced no observations."
+                    )
+                    _indexing_status[evidence_id] = {
+                        "evidence_id": evidence_id,
+                        "analysis_job_id": analysis_job_id,
+                        "status": "COMPLETED",
+                        "progress": 100.0,
+                        "stage": "READY",
+                        "total_documents": 0,
+                        "total_vlm_observations": 0,
+                        "total_embeddings": 0
+                    }
+                    return
 
-                # Stage 2: VLM Keyframe Analysis
-                logger.info(f"Executing VLM keyframe analysis for evidence {evidence_id}...")
-                vlm_obs = await VisionLanguageService.analyze_keyframes_for_job(
-                    db=db,
-                    evidence_id=evidence_id,
-                    analysis_job_id=analysis_job_id
-                )
-
-                active_indexing_jobs[evidence_id]["progress"] = 70.0
-                active_indexing_jobs[evidence_id]["stage"] = "VECTOR_EMBEDDING"
-
-                # Re-fetch all generated documents including VLM documents
+                # Re-query saved documents to get DB-assigned IDs
                 res_docs = await db.execute(
-                    select(ForensicDocument).where(ForensicDocument.evidence_id == evidence_id)
+                    select(ForensicDocument).where(
+                        ForensicDocument.evidence_id == evidence_id,
+                        ForensicDocument.analysis_job_id == analysis_job_id
+                    )
                 )
-                all_documents = res_docs.scalars().all()
+                saved_docs = res_docs.scalars().all()
 
-                # Stage 3: Embedding & Vector DB Insertion
-                logger.info(f"Embedding {len(all_documents)} documents into vector storage...")
-                embeddings = await VectorService.index_documents(
-                    db=db,
-                    evidence_id=evidence_id,
-                    analysis_job_id=analysis_job_id,
-                    documents=all_documents
+                _indexing_status[evidence_id].update({
+                    "progress": 50.0,
+                    "stage": "GENERATING_EMBEDDINGS",
+                    "total_documents": len(saved_docs)
+                })
+                logger.info(
+                    f"[INDEXER] Generating embeddings for {len(saved_docs)} documents "
+                    f"(evidence #{evidence_id}, job #{analysis_job_id})..."
                 )
 
-                # Record AI execution provenance
-                ai_exec = AIModelExecution(
-                    evidence_id=evidence_id,
-                    model_name="VLM + SentenceTransformer / VectorEngine",
-                    model_version="1.0",
-                    execution_type="SEMANTIC_INDEXING",
-                    input_parameters={"total_documents": len(all_documents)},
-                    verification_result="INDEX_VERIFIED_COMPLETED"
+                # 3. Generate Vector Embeddings (off the event-loop thread)
+                model = get_embedding_model()
+                doc_contents = [d.content for d in saved_docs]
+
+                loop = asyncio.get_event_loop()
+                embeddings = await loop.run_in_executor(
+                    None,
+                    lambda: model.encode(doc_contents, normalize_embeddings=True).tolist()
                 )
-                db.add(ai_exec)
+
+                # 4. Push into job-scoped ChromaDB collection
+                chroma_client = get_chroma_client()
+                collection_name = _chroma_collection_name(evidence_id, analysis_job_id)
+
+                # Delete and recreate for idempotency (retry-safe)
+                try:
+                    chroma_client.delete_collection(name=collection_name)
+                    logger.info(f"[INDEXER] Deleted existing ChromaDB collection '{collection_name}'.")
+                except Exception:
+                    pass
+
+                collection = chroma_client.create_collection(
+                    name=collection_name,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.info(f"[INDEXER] Created ChromaDB collection '{collection_name}'.")
+
+                vector_ids = [f"doc_{d.id}" for d in saved_docs]
+                metadatas = [
+                    {
+                        "doc_id": d.id,
+                        "evidence_id": d.evidence_id,
+                        "analysis_job_id": analysis_job_id,
+                        "track_id": d.track_id if d.track_id is not None else -1,
+                        "document_type": d.document_type.value,
+                        "start_time": float(d.start_time or 0.0),
+                        "end_time": float(d.end_time or 0.0)
+                    }
+                    for d in saved_docs
+                ]
+
+                collection.add(
+                    ids=vector_ids,
+                    embeddings=embeddings,
+                    documents=doc_contents,
+                    metadatas=metadatas
+                )
+                logger.info(
+                    f"[INDEXER] Upserted {len(saved_docs)} vectors into '{collection_name}'."
+                )
+
+                # 5. Persist EmbeddingRecords in DB (job-scoped)
+                embed_records = [
+                    EmbeddingRecord(
+                        evidence_id=evidence_id,
+                        analysis_job_id=analysis_job_id,
+                        forensic_document_id=d.id,
+                        vector_id=f"doc_{d.id}",
+                        embedding_model=settings.EMBEDDING_MODEL_NAME,
+                        document_type=d.document_type.value,
+                        source_type=d.source_type.value
+                    )
+                    for d in saved_docs
+                ]
+                db.add_all(embed_records)
                 await db.commit()
 
-                active_indexing_jobs[evidence_id] = {
+                _indexing_status[evidence_id] = {
                     "evidence_id": evidence_id,
                     "analysis_job_id": analysis_job_id,
                     "status": "COMPLETED",
                     "progress": 100.0,
                     "stage": "READY",
-                    "total_documents": len(all_documents),
-                    "total_vlm_observations": len(vlm_obs),
-                    "total_embeddings": len(embeddings),
-                    "error": None
+                    "total_documents": len(saved_docs),
+                    "total_vlm_observations": total_vlm,
+                    "total_embeddings": len(saved_docs)
                 }
-                logger.info(f"Semantic indexing completed successfully for evidence {evidence_id}.")
+                logger.info(
+                    f"[INDEXER] ✅ Successfully indexed {len(saved_docs)} documents "
+                    f"for evidence #{evidence_id}, job #{analysis_job_id}."
+                )
 
-        except Exception as e:
-            logger.exception(f"Error indexing evidence {evidence_id}: {e}")
-            active_indexing_jobs[evidence_id] = {
-                "evidence_id": evidence_id,
-                "analysis_job_id": analysis_job_id,
-                "status": "FAILED",
-                "progress": 0.0,
-                "stage": "FAILED",
-                "error": str(e)
-            }
+            except Exception as e:
+                logger.exception(
+                    f"[INDEXER] ❌ Failed to index evidence #{evidence_id}, job #{analysis_job_id}: {e}"
+                )
+                _indexing_status[evidence_id] = {
+                    "evidence_id": evidence_id,
+                    "analysis_job_id": analysis_job_id,
+                    "status": "FAILED",
+                    "progress": 0.0,
+                    "stage": "ERROR",
+                    "error": str(e),
+                    "total_documents": 0,
+                    "total_vlm_observations": 0,
+                    "total_embeddings": 0
+                }

@@ -91,42 +91,9 @@ class OpenVocabDetector:
                     })
                 return detections
             except Exception as ex:
-                logger.warning(f"[OPEN-VOCAB] OwlViT inference error ({ex}). Falling back to heuristic text concept search.")
+                logger.error(f"[OPEN-VOCAB] OwlViT inference error ({ex}). Zero heuristic fallbacks allowed.")
+                return []
 
-        # Fallback heuristic open-vocab search based on HSV color and bounding box contours
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        contours, _ = cv2.findContours(cv2.Canny(gray, 50, 150), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        logger.warning("[OPEN-VOCAB] Open-vocabulary neural detector unavailable. Zero heuristic contour fallbacks executed.")
+        return []
 
-        for concept in concepts:
-            concept_lower = concept.lower()
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > (w * h * 0.002):
-                    bx, by, bw, bh = cv2.boundingRect(cnt)
-                    aspect = bw / float(bh)
-
-                    # Quick heuristic class assignment
-                    matched = False
-                    if "car" in concept_lower or "vehicle" in concept_lower or "motorcycle" in concept_lower:
-                        if aspect > 1.1:
-                            matched = True
-                    elif "person" in concept_lower or "shirt" in concept_lower:
-                        if aspect < 0.95:
-                            matched = True
-                    elif "bag" in concept_lower or "backpack" in concept_lower or "umbrella" in concept_lower:
-                        matched = True
-
-                    if matched:
-                        detections.append({
-                            "frame_number": frame_number,
-                            "timestamp": timestamp,
-                            "class_name": concept,
-                            "confidence": 0.65,
-                            "bbox_x1": round(bx / float(w), 4),
-                            "bbox_y1": round(by / float(h), 4),
-                            "bbox_x2": round((bx + bw) / float(w), 4),
-                            "bbox_y2": round((by + bh) / float(h), 4),
-                            "detector": "heuristic_open_vocab"
-                        })
-
-        return detections

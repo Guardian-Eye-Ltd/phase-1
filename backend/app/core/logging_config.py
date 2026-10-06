@@ -14,9 +14,12 @@ def setup_logging():
         ]
     )
     
-    # Suppress verbose third-party logs (e.g. uvicorn, databases)
+    # Suppress verbose third-party logs (e.g. uvicorn, databases, httpx, huggingface)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
     logger = logging.getLogger("GuardianEye")
     logger.info("Structured logging framework initialized.")

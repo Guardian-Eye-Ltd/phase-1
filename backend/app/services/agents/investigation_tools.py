@@ -1,11 +1,12 @@
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.analysis import Track, Keyframe, Detection, ActivityInterval, PossibleInteraction
-from app.models.semantic import ForensicDocument, VLMObservation
+from app.models.semantic import ForensicDocument, DocumentType
 from app.services.semantic.hybrid_search_engine import HybridSearchEngine
+from app.services.pipeline.event_engine import EventEngine
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +17,14 @@ class InvestigationToolSystem:
     """
 
     @classmethod
-    async def find_person_tracks(
+    async def find_persons(
         cls, 
         db: AsyncSession, 
         evidence_id: int, 
         upper_color: Optional[str] = None,
         lower_color: Optional[str] = None,
-        carries_bag: Optional[bool] = None,
+        has_bag: Optional[bool] = None,
+        headwear: Optional[str] = None,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None
     ) -> List[Dict[str, Any]]:
@@ -42,20 +44,23 @@ class InvestigationToolSystem:
             doc_res = await db.execute(
                 select(ForensicDocument).where(
                     ForensicDocument.evidence_id == evidence_id,
-                    ForensicDocument.track_id == trk.track_number
+                    ForensicDocument.track_id == trk.track_number,
+                    ForensicDocument.document_type == DocumentType.TRACK
                 )
             )
             docs = doc_res.scalars().all()
             doc_meta = docs[0].metadata_json if docs else {}
 
-            # Filter attributes if specified
             if upper_color and doc_meta.get("upper_garment_color"):
                 if upper_color.lower() not in str(doc_meta.get("upper_garment_color")).lower():
                     continue
             if lower_color and doc_meta.get("lower_garment_color"):
                 if lower_color.lower() not in str(doc_meta.get("lower_garment_color")).lower():
                     continue
-            if carries_bag is True and not doc_meta.get("carries_bag"):
+            if headwear and doc_meta.get("headwear"):
+                if headwear.lower() not in str(doc_meta.get("headwear")).lower():
+                    continue
+            if has_bag is True and not doc_meta.get("carries_bag"):
                 continue
 
             results.append({
@@ -66,26 +71,33 @@ class InvestigationToolSystem:
                 "duration": trk.duration,
                 "upper_garment_color": doc_meta.get("upper_garment_color"),
                 "lower_garment_color": doc_meta.get("lower_garment_color"),
+                "headwear": doc_meta.get("headwear"),
                 "carries_bag": doc_meta.get("carries_bag", False),
                 "summary": docs[0].content if docs else f"Person Track #{trk.track_number}"
             })
 
-        logger.info(f"[TOOL] find_person_tracks returned {len(results)} records.")
+        logger.info(f"[TOOL] find_persons returned {len(results)} records.")
         return results
 
+    # Alias for backward compatibility
+    find_person_tracks = find_persons
+
     @classmethod
-    async def find_object_tracks(
+    async def find_vehicles(
         cls, 
         db: AsyncSession, 
         evidence_id: int, 
-        class_name: str,
+        color: Optional[str] = None,
+        body_type: Optional[str] = None,
+        license_plate: Optional[str] = None,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None
     ) -> List[Dict[str, Any]]:
-        """Finds object tracks (car, backpack, bicycle, truck, etc.)."""
-        stmt = select(Track).where(Track.evidence_id == evidence_id)
-        if class_name:
-            stmt = stmt.where(Track.class_name.ilike(f"%{class_name}%"))
+        """Finds vehicle tracks (car, truck, bus, motorcycle, van) matching fine-grained vehicle attributes."""
+        stmt = select(Track).where(
+            Track.evidence_id == evidence_id,
+            Track.class_name.in_(["car", "truck", "bus", "motorcycle", "van", "vehicle"])
+        )
         if start_time is not None:
             stmt = stmt.where(Track.last_seen_timestamp >= start_time)
         if end_time is not None:
@@ -96,14 +108,80 @@ class InvestigationToolSystem:
 
         results = []
         for trk in tracks:
+            doc_res = await db.execute(
+                select(ForensicDocument).where(
+                    ForensicDocument.evidence_id == evidence_id,
+                    ForensicDocument.track_id == trk.track_number,
+                    ForensicDocument.document_type == DocumentType.TRACK
+                )
+            )
+            docs = doc_res.scalars().all()
+            doc_meta = docs[0].metadata_json if docs else {}
+
+            if color and doc_meta.get("vehicle_color"):
+                if color.lower() not in str(doc_meta.get("vehicle_color")).lower():
+                    continue
+            if body_type and doc_meta.get("vehicle_body_style"):
+                if body_type.lower() not in str(doc_meta.get("vehicle_body_style")).lower():
+                    continue
+            if license_plate and doc_meta.get("license_plate_number"):
+                if license_plate.upper() not in str(doc_meta.get("license_plate_number")).upper():
+                    continue
+
             results.append({
                 "track_id": trk.track_number,
                 "class_name": trk.class_name,
                 "start_time": trk.first_seen_timestamp,
                 "end_time": trk.last_seen_timestamp,
                 "duration": trk.duration,
-                "observation_count": trk.observation_count
+                "vehicle_color": doc_meta.get("vehicle_color"),
+                "vehicle_body_style": doc_meta.get("vehicle_body_style"),
+                "license_plate_number": doc_meta.get("license_plate_number"),
+                "summary": docs[0].content if docs else f"Vehicle Track #{trk.track_number}"
             })
+
+        logger.info(f"[TOOL] find_vehicles returned {len(results)} records.")
+        return results
+
+    @classmethod
+    async def get_behavioral_events(
+        cls,
+        db: AsyncSession,
+        evidence_id: int,
+        event_type: Optional[str] = None,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """Retrieves structured behavioral events (loitering, concealment, altercation, sudden acceleration)."""
+        stmt = select(ForensicDocument).where(
+            ForensicDocument.evidence_id == evidence_id,
+            ForensicDocument.document_type == DocumentType.BEHAVIORAL_EVENT
+        )
+        if start_time is not None:
+            stmt = stmt.where(ForensicDocument.end_time >= start_time)
+        if end_time is not None:
+            stmt = stmt.where(ForensicDocument.start_time <= end_time)
+
+        res = await db.execute(stmt)
+        docs = res.scalars().all()
+
+        results = []
+        for d in docs:
+            e_type = d.metadata_json.get("event_type", "BEHAVIORAL_EVENT")
+            if event_type and event_type.lower() not in e_type.lower():
+                continue
+
+            results.append({
+                "document_id": d.id,
+                "title": d.title,
+                "event_type": e_type,
+                "summary": d.content,
+                "start_time": d.start_time,
+                "end_time": d.end_time,
+                "involved_track_ids": d.metadata_json.get("involved_track_ids", []),
+                "confidence": d.metadata_json.get("confidence", 0.90)
+            })
+        logger.info(f"[TOOL] get_behavioral_events returned {len(results)} events.")
         return results
 
     @classmethod

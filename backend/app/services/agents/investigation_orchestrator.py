@@ -138,13 +138,16 @@ class InvestigationOrchestrator:
         # Step 5: Report Generator Agent
         progress_history.append({"stage": "GENERATING_REPORT", "status": "IN_PROGRESS", "message": "Compiling formal digital forensics report..."})
         
+        ev_hash = evidence.sha256_hash if evidence and hasattr(evidence, 'sha256_hash') else None
+
         report_markdown = ForensicReportGenerator.generate_report(
             investigation_id=investigation_id,
             video_filename=video_filename,
             query_text=query_text,
             plan=plan_json,
             verified_findings=verified_findings,
-            timeline_events=detected_events
+            timeline_events=detected_events,
+            evidence_hash=ev_hash
         )
 
         progress_history.append({"stage": "GENERATING_REPORT", "status": "COMPLETED", "message": "Report generation complete."})

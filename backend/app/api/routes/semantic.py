@@ -3,7 +3,7 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from app.database.session import get_db
 from app.models.user import User
@@ -28,6 +28,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+async def _resolve_job(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
+    """
+    Returns the latest COMPLETED AnalysisJob for the given evidence.
+    Used by every semantic-layer endpoint to ensure job isolation.
+    """
+    res = await db.execute(
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.evidence_id == evidence_id,
+            AnalysisJob.status == JobStatus.COMPLETED
+        )
+        .order_by(desc(AnalysisJob.completed_at))
+    )
+    return res.scalars().first()
+
+
 @router.post("/evidence/{id}/semantic-index", response_model=SemanticStatusResponse)
 async def trigger_semantic_indexing(
     id: int,
@@ -37,37 +54,29 @@ async def trigger_semantic_indexing(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Triggers asynchronous background semantic indexing (Document Generation -> VLM -> Embeddings -> Vector DB).
+    Triggers asynchronous background semantic indexing for the latest COMPLETED job.
+    Each job gets its own isolated ChromaDB collection and ForensicDocument set.
     """
     ev_res = await db.execute(select(Evidence).where(Evidence.id == id))
     evidence = ev_res.scalar_one_or_none()
     if not evidence:
         raise HTTPException(status_code=404, detail="Evidence record not found.")
 
-    # Find latest completed analysis job
-    job_res = await db.execute(
-        select(AnalysisJob)
-        .where(AnalysisJob.evidence_id == id, AnalysisJob.status == JobStatus.COMPLETED)
-        .order_by(AnalysisJob.completed_at.desc())
-    )
-    job = job_res.scalars().first()
-
+    job = await _resolve_job(id, db)
     if not job:
         raise HTTPException(
-            status_code=400, 
-            detail="No completed Phase 1B analysis job found for this evidence. Please run analysis first."
+            status_code=400,
+            detail="No completed analysis job found for this evidence. Please run video analysis first."
         )
 
-    # Launch background indexing
     background_tasks.add_task(SemanticIndexer.index_evidence_async, id, job.id)
 
-    # Log audit entry
     audit = AuditLog(
         user_id=current_user.id,
         action="TRIGGER_SEMANTIC_INDEX",
         resource_type="EVIDENCE",
         resource_id=str(id),
-        metadata_json=f"Triggered background semantic indexing for evidence #{id}"
+        metadata_json=f"Triggered semantic indexing for evidence #{id}, job #{job.id}"
     )
     db.add(audit)
     await db.commit()
@@ -82,6 +91,7 @@ async def trigger_semantic_indexing(
         total_embeddings=0
     )
 
+
 @router.get("/evidence/{id}/semantic-status", response_model=SemanticStatusResponse)
 async def get_semantic_indexing_status(
     id: int,
@@ -90,30 +100,39 @@ async def get_semantic_indexing_status(
 ):
     """
     Poll background semantic indexing stage and percentage progress.
+    Falls back to DB document count scoped to the latest completed job.
     """
     status_dict = SemanticIndexer.get_indexing_status(id)
     if status_dict["status"] == "NOT_STARTED":
-        # Check DB if documents already exist
-        doc_count_res = await db.execute(
-            select(ForensicDocument).where(ForensicDocument.evidence_id == id)
-        )
-        docs = doc_count_res.scalars().all()
-        if docs:
-            vlm_res = await db.execute(
-                select(VLMObservation).where(VLMObservation.evidence_id == id)
+        job = await _resolve_job(id, db)
+        if job:
+            doc_res = await db.execute(
+                select(ForensicDocument).where(
+                    ForensicDocument.evidence_id == id,
+                    ForensicDocument.analysis_job_id == job.id
+                )
             )
-            vlms = vlm_res.scalars().all()
-            return SemanticStatusResponse(
-                evidence_id=id,
-                status="COMPLETED",
-                progress=100.0,
-                stage="READY",
-                total_documents=len(docs),
-                total_vlm_observations=len(vlms),
-                total_embeddings=len(docs)
-            )
+            docs = doc_res.scalars().all()
+            if docs:
+                vlm_res = await db.execute(
+                    select(VLMObservation).where(
+                        VLMObservation.evidence_id == id,
+                        VLMObservation.analysis_job_id == job.id
+                    )
+                )
+                vlms = vlm_res.scalars().all()
+                return SemanticStatusResponse(
+                    evidence_id=id,
+                    status="COMPLETED",
+                    progress=100.0,
+                    stage="READY",
+                    total_documents=len(docs),
+                    total_vlm_observations=len(vlms),
+                    total_embeddings=len(docs)
+                )
 
     return SemanticStatusResponse(**status_dict)
+
 
 @router.post("/evidence/{id}/search", response_model=SearchResponse)
 async def search_evidence(
@@ -123,9 +142,9 @@ async def search_evidence(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Executes natural language semantic forensic search grounded strictly in evidence observations.
+    Executes natural language semantic forensic search grounded strictly in evidence observations
+    from the latest completed analysis job.
     """
-    # Validate query is not empty or whitespace
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Search query cannot be empty.")
 
@@ -133,7 +152,6 @@ async def search_evidence(
     if not ev_res.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Evidence not found.")
 
-    # Execute Hybrid Search Engine
     search_output = await HybridSearchEngine.execute_search(
         db=db,
         evidence_id=id,
@@ -142,18 +160,18 @@ async def search_evidence(
         top_k=req.top_k
     )
 
-    # Log forensic audit event
     audit = AuditLog(
         user_id=current_user.id,
         action="SEMANTIC_SEARCH",
         resource_type="EVIDENCE",
         resource_id=str(id),
-        metadata_json=f"Query: '{req.query}'. Results count: {search_output['total_results']}"
+        metadata_json=f"Query: '{req.query}'. Results: {search_output.get('total_results', 0)}"
     )
     db.add(audit)
     await db.commit()
 
     return search_output
+
 
 @router.get("/evidence/{id}/timeline/enhanced", response_model=EnhancedTimelineResponse)
 async def get_enhanced_timeline(
@@ -162,12 +180,20 @@ async def get_enhanced_timeline(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Retrieves enhanced chronological forensic event timeline (Clickable events, timestamps, keyframe jump references).
+    Retrieves enhanced chronological forensic event timeline scoped to the latest COMPLETED job.
     """
     timeline_events: List[EnhancedTimelineEvent] = []
 
-    # Fetch tracks
-    tr_res = await db.execute(select(Track).where(Track.evidence_id == id).order_by(Track.first_seen_timestamp))
+    job = await _resolve_job(id, db)
+    if not job:
+        return EnhancedTimelineResponse(evidence_id=id, total_events=0, timeline=[])
+
+    # Tracks — scoped to job
+    tr_res = await db.execute(
+        select(Track)
+        .where(Track.evidence_id == id, Track.analysis_job_id == job.id)
+        .order_by(Track.first_seen_timestamp)
+    )
     tracks = tr_res.scalars().all()
 
     for trk in tracks:
@@ -178,15 +204,23 @@ async def get_enhanced_timeline(
             timestamp_str=ts_str,
             event_type="TRACK_ENTRY",
             title=f"Track {trk.track_number} ({trk.class_name.capitalize()}) Detected",
-            description=f"First seen at {ts_str}. Duration: {int(trk.duration)}s across {trk.observation_count} frames.",
+            description=(
+                f"First seen at {ts_str}. "
+                f"Duration: {int(trk.duration)}s across {trk.observation_count} frames. "
+                f"[Job #{job.id}]"
+            ),
             track_id=trk.track_number,
             confidence_score=0.92,
             source_type="OBJECT_DETECTION_TRACKER",
             is_clickable=True
         ))
 
-    # Fetch keyframes
-    kf_res = await db.execute(select(Keyframe).where(Keyframe.evidence_id == id).order_by(Keyframe.timestamp))
+    # Keyframes — scoped to job
+    kf_res = await db.execute(
+        select(Keyframe)
+        .where(Keyframe.evidence_id == id, Keyframe.analysis_job_id == job.id)
+        .order_by(Keyframe.timestamp)
+    )
     keyframes = kf_res.scalars().all()
 
     for kf in keyframes:
@@ -205,8 +239,15 @@ async def get_enhanced_timeline(
             is_clickable=True
         ))
 
-    # Fetch spatial interactions
-    inter_res = await db.execute(select(PossibleInteraction).where(PossibleInteraction.evidence_id == id).order_by(PossibleInteraction.start_time))
+    # Spatial interactions — scoped to job
+    inter_res = await db.execute(
+        select(PossibleInteraction)
+        .where(
+            PossibleInteraction.evidence_id == id,
+            PossibleInteraction.analysis_job_id == job.id
+        )
+        .order_by(PossibleInteraction.start_time)
+    )
     interactions = inter_res.scalars().all()
 
     for inter in interactions:
@@ -217,14 +258,16 @@ async def get_enhanced_timeline(
             timestamp_str=ts_str,
             event_type="SPATIAL_INTERACTION",
             title=f"Spatial Interaction: Track {inter.entity_a_track_id} & Track {inter.entity_b_track_id}",
-            description=f"Proximity detected near Track {inter.entity_b_track_id} between {ts_str} and {ForensicDocumentGenerator.format_timestamp(inter.end_time)}.",
+            description=(
+                f"Proximity detected between {ts_str} and "
+                f"{ForensicDocumentGenerator.format_timestamp(inter.end_time)}."
+            ),
             track_id=inter.entity_a_track_id,
             confidence_score=inter.confidence_score,
             source_type="INTERACTION_DETECTOR",
             is_clickable=True
         ))
 
-    # Sort all events chronologically
     timeline_events.sort(key=lambda x: x.timestamp)
 
     return EnhancedTimelineResponse(
@@ -233,6 +276,7 @@ async def get_enhanced_timeline(
         timeline=timeline_events
     )
 
+
 @router.get("/evidence/{id}/forensic-documents", response_model=List[ForensicDocumentResponse])
 async def get_forensic_documents(
     id: int,
@@ -240,12 +284,22 @@ async def get_forensic_documents(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Retrieve evidence-grounded ForensicDocument records generated from Phase 1B observations.
+    Retrieve ForensicDocument records scoped to the latest completed analysis job.
     """
+    job = await _resolve_job(id, db)
+    if not job:
+        return []
+
     res = await db.execute(
-        select(ForensicDocument).where(ForensicDocument.evidence_id == id).order_by(ForensicDocument.created_at.desc())
+        select(ForensicDocument)
+        .where(
+            ForensicDocument.evidence_id == id,
+            ForensicDocument.analysis_job_id == job.id
+        )
+        .order_by(ForensicDocument.created_at.desc())
     )
     return res.scalars().all()
+
 
 @router.get("/evidence/{id}/ai-observations", response_model=List[VLMObservationResponse])
 async def get_vlm_observations(
@@ -254,12 +308,22 @@ async def get_vlm_observations(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Retrieve VLM keyframe visual observations with provenance metadata.
+    Retrieve VLM keyframe visual observations scoped to the latest completed analysis job.
     """
+    job = await _resolve_job(id, db)
+    if not job:
+        return []
+
     res = await db.execute(
-        select(VLMObservation).where(VLMObservation.evidence_id == id).order_by(VLMObservation.created_at.desc())
+        select(VLMObservation)
+        .where(
+            VLMObservation.evidence_id == id,
+            VLMObservation.analysis_job_id == job.id
+        )
+        .order_by(VLMObservation.created_at.desc())
     )
     return res.scalars().all()
+
 
 @router.get("/search/{search_id}")
 async def get_search_query_details(

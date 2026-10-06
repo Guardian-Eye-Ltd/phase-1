@@ -19,13 +19,39 @@ DEFAULT_ROLES = [
     {"id": 4, "role_name": "Viewer"}
 ]
 
+async def auto_migrate_schema(db_engine: AsyncEngine = engine):
+    """
+    Safely adds missing diagnostic counter columns to existing analysis_jobs tables if they don't exist.
+    Prevents OperationalError on existing SQLite/PostgreSQL databases without manual migrations.
+    """
+    new_columns = [
+        ("frames_sampled", "INTEGER DEFAULT 0 NOT NULL"),
+        ("frames_with_detections", "INTEGER DEFAULT 0 NOT NULL"),
+        ("raw_detections", "INTEGER DEFAULT 0 NOT NULL"),
+        ("stored_detections", "INTEGER DEFAULT 0 NOT NULL"),
+        ("unique_tracks", "INTEGER DEFAULT 0 NOT NULL"),
+        ("unique_keyframes", "INTEGER DEFAULT 0 NOT NULL"),
+        ("activity_intervals_count", "INTEGER DEFAULT 0 NOT NULL"),
+    ]
+    async with db_engine.begin() as conn:
+        for col_name, col_def in new_columns:
+            try:
+                await conn.execute(
+                    __import__("sqlalchemy").text(f"ALTER TABLE analysis_jobs ADD COLUMN {col_name} {col_def}")
+                )
+                logger.info(f"Schema migration: Added column '{col_name}' to analysis_jobs table.")
+            except Exception:
+                # Column already exists
+                pass
+
 async def create_tables(db_engine: AsyncEngine = engine):
     """
-    Create database tables defined in SQLAlchemy Base metadata.
+    Create database tables defined in SQLAlchemy Base metadata and apply safe schema migrations.
     """
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables initialized successfully.")
+    await auto_migrate_schema(db_engine)
+    logger.info("Database tables and schema migrations initialized successfully.")
 
 async def seed_roles():
     """
