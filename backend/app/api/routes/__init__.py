@@ -10,6 +10,8 @@ from app.api.routes.health import router as health_router
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.semantic import router as semantic_router
 from app.api.routes.investigation import router as investigation_router
+from app.api.routes.admin import router as admin_router
+from app.api.routes.faces import router as faces_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -23,6 +25,8 @@ api_router.include_router(streams_router)
 api_router.include_router(alerts_router)
 api_router.include_router(incidents_router)
 api_router.include_router(health_router)
+api_router.include_router(admin_router)
+api_router.include_router(faces_router)
 
 __all__ = ["api_router"]
 

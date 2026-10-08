@@ -20,6 +20,7 @@ from app.schemas.semantic import (
     ForensicDocumentResponse, VLMObservationResponse,
     EnhancedTimelineResponse, EnhancedTimelineEvent
 )
+from app.services.analysis_jobs import get_active_analysis_job
 from app.services.semantic.indexer import SemanticIndexer
 from app.services.semantic.hybrid_search_engine import HybridSearchEngine
 from app.services.semantic.document_generator import ForensicDocumentGenerator
@@ -30,19 +31,7 @@ router = APIRouter()
 
 
 async def _resolve_job(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
-    """
-    Returns the latest COMPLETED AnalysisJob for the given evidence.
-    Used by every semantic-layer endpoint to ensure job isolation.
-    """
-    res = await db.execute(
-        select(AnalysisJob)
-        .where(
-            AnalysisJob.evidence_id == evidence_id,
-            AnalysisJob.status == JobStatus.COMPLETED
-        )
-        .order_by(desc(AnalysisJob.completed_at))
-    )
-    return res.scalars().first()
+    return await get_active_analysis_job(db, evidence_id)
 
 
 @router.post("/evidence/{id}/semantic-index", response_model=SemanticStatusResponse)

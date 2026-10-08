@@ -2,6 +2,7 @@ from enum import Enum
 from typing import List, Union
 from fastapi import HTTPException, status, Depends
 from app.models.user import User
+from app.api.dependencies.auth import get_current_user
 
 class SystemRole(str, Enum):
     """Enumeration of system authorization roles."""
@@ -27,7 +28,9 @@ class PermissionChecker:
         ]
 
 
-    def __call__(self, current_user: User) -> User:
+    # Without Depends(), FastAPI would try to read current_user from the request
+    # body instead of resolving it from the bearer token.
+    def __call__(self, current_user: User = Depends(get_current_user)) -> User:
         """
         Enforce role validation against the current user context.
         

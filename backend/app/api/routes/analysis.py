@@ -15,10 +15,19 @@ from app.models.analysis import (
     FrameObservation, Detection, Track, Keyframe, PossibleInteraction
 )
 from app.core.config import settings
+from app.core.permissions import RequireAdmin
 from app.api.routes.auth import get_current_user
 from app.services.analysis_runner import run_analysis_job_async, active_job_cancellations
+from app.services.analysis_jobs import AnalysisJobNotFound, get_active_analysis_job
+from app.services.analysis_statistics import compute_analysis_statistics
 from app.services.pipeline.manifest_generator import ManifestGenerator
+from app.services.system_reset_service import ResetBlockedError, SystemResetService
 from pydantic import BaseModel, Field
+
+JOB_ID_QUERY = Query(
+    None,
+    description="Analysis run to read. Defaults to the latest completed run for this evidence.",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,66 +152,214 @@ async def cancel_analysis_job(
 
     return {"message": "Job cancellation requested", "job_id": job_id}
 
-async def _get_latest_completed_job(evidence_id: int, db: AsyncSession) -> Optional[AnalysisJob]:
+async def _get_latest_completed_job(
+    evidence_id: int, db: AsyncSession, job_id: Optional[int] = None
+) -> Optional[AnalysisJob]:
     """
-    Returns the most recently COMPLETED AnalysisJob for an evidence file.
-    QUEUED, PROCESSING, FAILED, and CANCELLED jobs are intentionally excluded
-    so that prior good analysis data remains visible while a new job is running.
+    The analysis run a read route should use. An explicit job_id that is wrong
+    for this evidence is a 404, never a silent fallback to another run.
     """
-    res = await db.execute(
-        select(AnalysisJob)
-        .where(
-            AnalysisJob.evidence_id == evidence_id,
-            AnalysisJob.status == JobStatus.COMPLETED
-        )
-        .order_by(desc(AnalysisJob.completed_at))
-    )
-    return res.scalars().first()
+    try:
+        return await get_active_analysis_job(db, evidence_id, job_id, strict=job_id is not None)
+    except AnalysisJobNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-# Backward-compatible alias used by manifest route
-_get_latest_job_for_evidence = _get_latest_completed_job
+
+class ResetAnalysisRequest(BaseModel):
+    confirmation: str = Field(..., description="Must be exactly 'RESET EVIDENCE <evidence_id>'.")
+
 
 @router.post("/{evidence_id}/reset-analysis", status_code=status.HTTP_200_OK)
 async def reset_evidence_analysis(
     evidence_id: int,
+    req: ResetAnalysisRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(RequireAdmin),
 ):
     """
-    Deletes all derived analysis jobs, detections, tracks, keyframes, and events for an evidence file.
-    Leaves original video file intact for testing re-runs.
+    Admin only. Deletes every analysis run of one evidence file and everything
+    derived from them (DB rows, keyframes, sealed manifests, vector index). The
+    evidence record and original video are kept so it can be re-analysed.
     """
-    ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
-    evidence = ev_res.scalar_one_or_none()
-    if not evidence:
-        raise HTTPException(status_code=404, detail="Evidence not found")
+    expected = f"RESET EVIDENCE {evidence_id}"
+    if req.confirmation != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirmation phrase mismatch. Type exactly: {expected}",
+        )
+    try:
+        return await SystemResetService.reset_evidence_analysis(db, evidence_id, current_user.id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ResetBlockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
-    await db.execute(delete(Detection).where(Detection.evidence_id == evidence_id))
-    await db.execute(delete(Track).where(Track.evidence_id == evidence_id))
-    await db.execute(delete(Keyframe).where(Keyframe.evidence_id == evidence_id))
-    await db.execute(delete(ActivityInterval).where(ActivityInterval.evidence_id == evidence_id))
-    await db.execute(delete(PossibleInteraction).where(PossibleInteraction.evidence_id == evidence_id))
-    await db.execute(delete(FrameObservation).where(FrameObservation.evidence_id == evidence_id))
-    await db.execute(delete(AnalysisJob).where(AnalysisJob.evidence_id == evidence_id))
 
-    evidence.status = EvidenceStatus.UPLOADED
-    await db.commit()
+@router.get("/{evidence_id}/statistics")
+async def get_analysis_statistics(
+    evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Canonical AnalysisStatistics for one analysis run. Stored-entity counts are
+    recomputed from the database; run-time-only counters are None for runs that
+    predate their recording.
+    """
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No completed analysis job for this evidence.")
+    return (await compute_analysis_statistics(db, job)).to_dict()
 
-    audit = AuditLog(
-        user_id=current_user.id,
-        action="ANALYSIS_RESET",
-        resource_type="EVIDENCE",
-        resource_id=str(evidence_id),
-        metadata_json=f"Reset derived analysis data for evidence #{evidence_id}"
-    )
-    db.add(audit)
-    await db.commit()
 
-    return {"message": f"Successfully reset analysis state for evidence #{evidence_id}", "evidence_id": evidence_id}
+_VEHICLE_CLASSES = ("car", "truck", "bus", "motorcycle", "van", "bicycle")
+_PERSON_FIELDS = ["upper_garment_presence", "upper_garment_color", "upper_garment_type",
+                  "lower_garment_color", "headwear", "carries_bag", "carried_item"]
+_VEHICLE_FIELDS = ["vehicle_color", "vehicle_body_style", "license_plate_text"]
+
+
+@router.get("/{evidence_id}/entities")
+async def get_entities(
+    evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Every tracked person and vehicle with its temporally aggregated attributes
+    (value, confidence, status, frame support) and, for anything not
+    determined, the reason — so "unknown" is always explained.
+    """
+    from app.models.observation import TrackAttributeAggregate
+    from app.services.pipeline.alpr_service import MIN_VEHICLE_WIDTH_FOR_OCR_PX
+    from app.services.pipeline.capability_registry import get_capability
+
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No completed analysis job for this evidence.")
+    evidence = (await db.execute(select(Evidence).where(Evidence.id == evidence_id))).scalars().first()
+    frame_w = None
+    if evidence and evidence.resolution and "x" in evidence.resolution:
+        try:
+            frame_w = int(evidence.resolution.split("x")[0])
+        except ValueError:
+            frame_w = None
+
+    tracks = (await db.execute(
+        select(Track).where(Track.analysis_job_id == job.id).order_by(Track.track_number)
+    )).scalars().all()
+    aggs = (await db.execute(
+        select(TrackAttributeAggregate).where(TrackAttributeAggregate.analysis_job_id == job.id)
+    )).scalars().all()
+    by_track: Dict[int, Dict[str, Any]] = {}
+    for a in aggs:
+        by_track.setdefault(a.track_number, {})[a.attribute] = {
+            "value": a.value,
+            "confidence": round(a.confidence, 3),
+            "status": a.status.value,
+            "supporting_count": a.supporting_count,
+            "observation_count": a.observation_count,
+            "withheld_reason": (
+                (a.confidence_breakdown or {}).get("contradicted_by")
+                or (a.confidence_breakdown or {}).get("withheld_reason")
+                or ("frames disagree or confidence too low" if a.status.value == "WITHHELD" else None)
+            ),
+        }
+
+    max_width = dict((await db.execute(
+        select(Detection.track_id, func.max(Detection.bbox_x2 - Detection.bbox_x1))
+        .where(Detection.analysis_job_id == job.id, Detection.track_id.isnot(None))
+        .group_by(Detection.track_id)
+    )).all())
+
+    make_cap = get_capability("vehicle_make")
+    plate_cap = get_capability("license_plate_text")
+    garment_cap = get_capability("person_garment_color")
+
+    entities = []
+    for t in tracks:
+        attrs = by_track.get(t.track_number, {})
+        not_determined: Dict[str, str] = {}
+        if t.class_name == "person":
+            kind, fields = "PERSON", _PERSON_FIELDS
+            if garment_cap["state"] == "NOT_AVAILABLE":
+                not_determined["clothing"] = garment_cap["reason"]
+            else:
+                if "upper_garment_presence" not in attrs and "upper_garment_color" not in attrs:
+                    not_determined["upper_garment"] = "upper body not visible clearly enough in any sampled frame"
+                if "lower_garment_color" not in attrs:
+                    not_determined["lower_garment"] = "legs not visible (knees/ankles not detected) or bare"
+            if "carried_item" not in attrs:
+                not_determined["carried_item"] = "no bag detected with this person (not proof that none was carried)"
+        elif t.class_name in _VEHICLE_CLASSES:
+            kind, fields = "VEHICLE", _VEHICLE_FIELDS
+            if "license_plate_text" not in attrs:
+                width_px = int(max_width.get(t.track_number, 0) * frame_w) if frame_w else None
+                if plate_cap["state"] == "NOT_AVAILABLE":
+                    not_determined["license_plate_text"] = plate_cap["reason"]
+                elif width_px is not None and width_px < MIN_VEHICLE_WIDTH_FOR_OCR_PX:
+                    not_determined["license_plate_text"] = (
+                        f"vehicle too small to read a plate (largest view {width_px}px wide; "
+                        f"needs at least {MIN_VEHICLE_WIDTH_FOR_OCR_PX}px)"
+                    )
+                else:
+                    not_determined["license_plate_text"] = "no readable plate text in the vehicle's clearest frames"
+            not_determined["vehicle_make_model"] = make_cap["reason"]
+        else:
+            kind, fields = "OBJECT", []
+        entities.append({
+            "track_id": t.track_number,
+            "class_name": t.class_name,
+            "entity_type": kind,
+            "first_seen": t.first_seen_timestamp,
+            "last_seen": t.last_seen_timestamp,
+            "duration": t.duration,
+            "observation_count": t.observation_count,
+            "attributes": {f: attrs[f] for f in fields if f in attrs},
+            "not_determined": not_determined,
+        })
+
+    return {
+        "evidence_id": evidence_id,
+        "analysis_job_id": job.id,
+        "attributes_extracted": bool(aggs),
+        "entities": entities,
+    }
+
+
+@router.get("/{evidence_id}/analysis-jobs")
+async def list_analysis_jobs(
+    evidence_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every analysis run of this evidence, newest first, marking the active one."""
+    active = await get_active_analysis_job(db, evidence_id)
+    jobs = (await db.execute(
+        select(AnalysisJob)
+        .where(AnalysisJob.evidence_id == evidence_id)
+        .order_by(desc(AnalysisJob.id))
+    )).scalars().all()
+    return [
+        {
+            "job_id": j.id,
+            "status": j.status,
+            "is_active": active is not None and j.id == active.id,
+            "started_at": j.started_at,
+            "completed_at": j.completed_at,
+            "sampling_fps": j.sampling_fps,
+            "confidence_threshold": j.confidence_threshold,
+            "model_name": j.model_name,
+            "error_message": j.error_message,
+        }
+        for j in jobs
+    ]
 
 @router.get("/{evidence_id}/detections")
 async def get_evidence_detections(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     class_name: Optional[str] = Query(None),
     track_id: Optional[int] = Query(None),
     limit: int = Query(200, ge=1, le=1000),
@@ -213,7 +370,7 @@ async def get_evidence_detections(
     """
     Retrieves paginated object and person detections for the latest analysis job of an evidence file.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         return []
 
@@ -243,6 +400,7 @@ async def get_evidence_detections(
 @router.get("/{evidence_id}/tracks")
 async def get_evidence_tracks(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     class_name: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -250,7 +408,7 @@ async def get_evidence_tracks(
     """
     Retrieves tracked entity summaries for the latest analysis job of an evidence file.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         return []
 
@@ -280,13 +438,14 @@ async def get_evidence_tracks(
 @router.get("/{evidence_id}/keyframes")
 async def get_evidence_keyframes(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Retrieves extracted forensic keyframe images for the latest analysis job.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         return []
 
@@ -313,13 +472,14 @@ async def get_evidence_keyframes(
 @router.get("/{evidence_id}/activity")
 async def get_evidence_activity_intervals(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Retrieves motion activity intervals for the latest analysis job.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         return []
 
@@ -346,13 +506,14 @@ async def get_evidence_activity_intervals(
 @router.get("/{evidence_id}/timeline")
 async def get_evidence_timeline(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Retrieves unified chronological forensic observations timeline for the latest analysis job.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         return []
 
@@ -407,15 +568,37 @@ async def get_evidence_timeline(
 @router.get("/{evidence_id}/manifest")
 async def get_evidence_manifest(
     evidence_id: int,
+    job_id: Optional[int] = JOB_ID_QUERY,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Retrieves the machine-readable cryptographic analysis manifest for evidence provenance verification.
+    Returns the manifest sealed at analysis completion and verifies that its
+    SHA-256 still matches the hash recorded on the job. Jobs that predate sealed
+    manifests get a reconstruction that is explicitly flagged as unverifiable.
     """
-    job = await _get_latest_completed_job(evidence_id, db)
+    job = await _get_latest_completed_job(evidence_id, db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="No completed analysis job found for this evidence. Run analysis first.")
+
+    sealed_path = ManifestGenerator.manifest_path(evidence_id, job.id)
+    if sealed_path.exists():
+        manifest_dict, actual_hash, verified = ManifestGenerator.load_and_verify(
+            sealed_path, job.manifest_hash
+        )
+        if not verified:
+            logger.error(
+                "[INTEGRITY] Manifest for evidence=%s job=%s does not match recorded hash "
+                "(recorded=%s actual=%s)", evidence_id, job.id, job.manifest_hash, actual_hash,
+            )
+        return {
+            "manifest_data": manifest_dict,
+            "sha256_hash": actual_hash,
+            "recorded_hash": job.manifest_hash,
+            "integrity_verified": verified,
+            "source": "SEALED",
+            "analysis_job_id": job.id,
+        }
 
     ev_res = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
     evidence = ev_res.scalar_one_or_none()
@@ -465,25 +648,8 @@ async def get_evidence_manifest(
         for t in tracks
     ]
 
-    obs_res = await db.execute(select(func.count(FrameObservation.id)).where(FrameObservation.analysis_job_id == job.id))
-    total_frames_sampled = obs_res.scalar() or 0
-
-    act_res = await db.execute(select(func.count(ActivityInterval.id)).where(ActivityInterval.analysis_job_id == job.id))
-    total_activity_intervals = act_res.scalar() or 0
-
-    stats = {
-        "job_id": job.id,
-        "status": job.status,
-        "progress": job.progress,
-        "total_frames_sampled": job.frames_sampled or total_frames_sampled,
-        "frames_with_detections": job.frames_with_detections or 0,
-        "raw_detections": job.raw_detections or 0,
-        "total_detections": len(detections),
-        "total_tracks": len(tracks),
-        "total_keyframes": len(keyframes),
-        "total_activity_intervals": total_activity_intervals,
-        "manifest_hash": job.manifest_hash
-    }
+    stats = (await compute_analysis_statistics(db, job)).to_dict()
+    stats.pop("definitions", None)
 
     manifest_dict, manifest_hash = ManifestGenerator.generate_manifest(
         evidence_id=evidence_id,
@@ -502,9 +668,15 @@ async def get_evidence_manifest(
         tracks=trk_dicts
     )
 
+    # Rebuilt from current DB rows: its hash cannot match the one recorded at
+    # completion, so it must never be presented as verified.
     return {
         "manifest_data": manifest_dict,
-        "sha256_hash": manifest_hash
+        "sha256_hash": manifest_hash,
+        "recorded_hash": job.manifest_hash,
+        "integrity_verified": False,
+        "source": "RECONSTRUCTED",
+        "analysis_job_id": job.id,
     }
 
 @router.get("/{evidence_id}/derived/keyframes/{filename}")

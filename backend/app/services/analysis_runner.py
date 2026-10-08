@@ -10,6 +10,10 @@ from app.models.analysis import (
     FrameObservation, Detection, Track, Keyframe, PossibleInteraction
 )
 from app.models.evidence import Evidence, EvidenceStatus
+from app.models.observation import (
+    VisualAttributeObservation, TrackAttributeAggregate,
+    ObservationStatus, ObservationSource, EntityType
+)
 from app.models.audit import AuditLog
 from app.core.config import settings
 from app.services.pipeline.video_validator import VideoValidator
@@ -21,12 +25,23 @@ from app.services.pipeline.keyframe_extractor import KeyframeExtractor
 from app.services.pipeline.interaction_detector import InteractionDetector
 from app.services.pipeline.event_engine import EventEngine
 from app.services.pipeline.manifest_generator import ManifestGenerator
+from app.services.pipeline.attribute_aggregator import AttributeAggregator
+from app.services.pipeline.face_extractor import extract_faces
+from app.services.pipeline.alpr_service import read_vehicle_plates
+from app.services.face.engine import FaceEngine
+from app.models.face import FaceObservation
+from app.services.analysis_statistics import STATS_SCHEMA_VERSION, compute_analysis_statistics
+from app.services.pipeline.capability_registry import capability_report, get_capability
 from app.services.semantic.indexer import SemanticIndexer
 
 logger = logging.getLogger(__name__)
 
 # Active background jobs dict for cancellation support
 active_job_cancellations = set()
+
+# Jobs actually executing in this process. Tracked in memory rather than via the
+# DB status column, because a crashed run leaves a row stuck at PROCESSING forever.
+running_analysis_jobs: set = set()
 
 async def run_analysis_job_async(job_id: int):
     """
@@ -64,8 +79,12 @@ async def run_analysis_job_async(job_id: int):
         await db.execute(delete(ActivityInterval).where(ActivityInterval.analysis_job_id == job.id))
         await db.execute(delete(PossibleInteraction).where(PossibleInteraction.analysis_job_id == job.id))
         await db.execute(delete(FrameObservation).where(FrameObservation.analysis_job_id == job.id))
+        await db.execute(delete(VisualAttributeObservation).where(VisualAttributeObservation.analysis_job_id == job.id))
+        await db.execute(delete(TrackAttributeAggregate).where(TrackAttributeAggregate.analysis_job_id == job.id))
+        await db.execute(delete(FaceObservation).where(FaceObservation.analysis_job_id == job.id))
         await db.commit()
 
+        running_analysis_jobs.add(job_id)
         try:
             # Stage 1: Video Validation
             if job_id in active_job_cancellations:
@@ -231,6 +250,139 @@ async def run_analysis_job_async(job_id: int):
             ])
             await db.flush()
 
+            # Stage 6b: Visual Attribute Observations & Temporal Aggregation
+            # The detector already computed garment/vehicle colors, headwear,
+            # carried items and plate reads. Persist them with provenance so
+            # structured attribute search has something to query.
+            attr_observations = AttributeAggregator.extract_observations(final_detections)
+
+            caps = capability_report()
+            capability_states = {name: c["state"] for name, c in caps.items()}
+
+            # Licence plates: read once per vehicle track on its best frames.
+            if caps.get("license_plate_text", {}).get("state") != "NOT_AVAILABLE":
+                attr_observations += await asyncio.to_thread(
+                    read_vehicle_plates, sampled_frames, final_detections
+                )
+
+            _MODEL_BY_SOURCE = {
+                "CLIP_ZERO_SHOT": settings.CLIP_MODEL_NAME,
+                "POSE_CROP_COLOR_MODEL": f"{settings.YOLO_POSE_MODEL_NAME}+hsv-colour-naming",
+                "COLOR_HEURISTIC": "hsv-colour-naming",
+                "COMBINED": f"{settings.CLIP_MODEL_NAME}+hsv-colour-naming",
+                "ALPR_OCR": "easyocr",
+            }
+
+            def _source(obs):
+                try:
+                    return ObservationSource(obs.get("source", "CLIP_ZERO_SHOT"))
+                except ValueError:
+                    return ObservationSource.CLIP_ZERO_SHOT
+
+            db.add_all([
+                VisualAttributeObservation(
+                    evidence_id=evidence.id,
+                    analysis_job_id=job.id,
+                    track_number=obs["track_number"],
+                    frame_number=obs["frame_number"],
+                    timestamp=obs["timestamp"],
+                    entity_type=EntityType(obs["entity_type"]),
+                    attribute=obs["attribute"],
+                    value=obs["value"],
+                    confidence=obs["confidence"],
+                    source=_source(obs),
+                    model_name=_MODEL_BY_SOURCE.get(_source(obs).value, "unknown"),
+                    model_version="2.0",
+                    status=ObservationStatus.OBSERVED,
+                )
+                for obs in attr_observations
+            ])
+
+            track_obs_counts = {t["track_number"]: t["observation_count"] for t in track_summaries}
+            aggregates = AttributeAggregator.aggregate(
+                attr_observations,
+                track_observation_counts=track_obs_counts,
+                capability_states=capability_states,
+            )
+
+            db.add_all([
+                TrackAttributeAggregate(
+                    evidence_id=evidence.id,
+                    analysis_job_id=job.id,
+                    track_number=agg["track_number"],
+                    entity_type=EntityType(agg["entity_type"]),
+                    attribute=agg["attribute"],
+                    value=agg["value"],
+                    confidence=agg["confidence"],
+                    observation_count=agg["observation_count"],
+                    supporting_count=agg["supporting_count"],
+                    dissenting_count=agg["dissenting_count"],
+                    first_observed_at=agg["first_observed_at"],
+                    last_observed_at=agg["last_observed_at"],
+                    source=ObservationSource.COMBINED,
+                    status=ObservationStatus(agg["status"]),
+                    confidence_breakdown=agg["confidence_breakdown"],
+                )
+                for agg in aggregates
+            ])
+            await db.flush()
+
+            vehicle_attr_count = sum(1 for o in attr_observations if o["entity_type"] == "VEHICLE")
+            plate_obs_count = sum(1 for o in attr_observations if o["attribute"] == "license_plate_text")
+            withheld_count = sum(1 for a in aggregates if a["status"] == "WITHHELD")
+
+            logger.info(
+                "[ATTRIBUTES] job=%s observations=%d (vehicle=%d plate=%d) "
+                "aggregates=%d withheld=%d",
+                job_id, len(attr_observations), vehicle_attr_count,
+                plate_obs_count, len(aggregates), withheld_count,
+            )
+
+            # Stage 6c: Face extraction from person tracks. A failure here is
+            # recorded on the job (face_stage) rather than failing the analysis,
+            # so face search can say exactly why it has nothing to compare.
+            face_cap = get_capability("face_recognition")
+            if face_cap["state"] == "NOT_AVAILABLE":
+                job.face_stage, job.face_stage_detail = "UNAVAILABLE", face_cap["reason"]
+            elif not await asyncio.to_thread(FaceEngine.load):
+                job.face_stage, job.face_stage_detail = "UNAVAILABLE", FaceEngine.load_error()
+            else:
+                try:
+                    face_obs = await asyncio.to_thread(
+                        extract_faces, sampled_frames, final_detections,
+                        evidence.id, job.id, settings.DERIVED_STORAGE_DIR,
+                    )
+                    db.add_all([
+                        FaceObservation(
+                            evidence_id=evidence.id,
+                            analysis_job_id=job.id,
+                            track_number=o["track_number"],
+                            frame_number=o["frame_number"],
+                            timestamp=o["timestamp"],
+                            bbox_x1=o["bbox"][0], bbox_y1=o["bbox"][1],
+                            bbox_x2=o["bbox"][2], bbox_y2=o["bbox"][3],
+                            face_width_px=o["face_width_px"],
+                            face_height_px=o["face_height_px"],
+                            det_score=o["det_score"],
+                            sharpness=o["sharpness"],
+                            quality_status=o["quality_status"],
+                            quality_reasons=o["quality_reasons"],
+                            embedding_encrypted=o["embedding_encrypted"],
+                            embedding_model=o["embedding_model"],
+                            embedding_dim=o["embedding_dim"],
+                            crop_filename=o["crop_filename"],
+                            crop_sha256=o["crop_sha256"],
+                        )
+                        for o in face_obs
+                    ])
+                    await db.flush()
+                    usable = sum(1 for o in face_obs if o["quality_status"] == "USABLE")
+                    job.face_stage = "COMPLETED"
+                    job.face_stage_detail = f"{len(face_obs)} face(s) extracted, {usable} usable for comparison."
+                except Exception as e:
+                    logger.exception(f"[FACE] Face extraction failed for job {job_id}: {e}")
+                    job.face_stage, job.face_stage_detail = "FAILED", f"{type(e).__name__}: {e}"
+
             # Stage 7: Keyframe Extraction & Spatial Interaction Detection
             if job_id in active_job_cancellations:
                 raise asyncio.CancelledError("Job cancelled by user.")
@@ -244,7 +396,8 @@ async def run_analysis_job_async(job_id: int):
                 final_detections,
                 track_summaries,
                 evidence.id,
-                settings.DERIVED_STORAGE_DIR
+                settings.DERIVED_STORAGE_DIR,
+                analysis_job_id=job.id,
             )
 
             db.add_all([
@@ -287,61 +440,66 @@ async def run_analysis_job_async(job_id: int):
             # Run deterministic event engine for loitering, proximity, and carried objects
             detected_events = EventEngine.detect_events(track_summaries, final_detections)
 
-            # Write all pipeline diagnostic counters to the job record
+            # Run-time counters (only knowable now). Stored-entity counts are
+            # recomputed from the DB by compute_analysis_statistics.
+            diag = detector.last_diagnostics
+            job.source_frames = video_info["frame_count"]
+            job.processed_frames = diag.get("processed_frames", 0)
+            job.raw_detections = diag.get("raw_model_detections", 0)
+            job.confidence_filtered_detections = diag.get("confidence_filtered_detections", 0)
+            job.class_filtered_detections = diag.get("class_filtered_detections", 0)
+            job.event_candidates = len(detected_events)
+            job.stats_schema_version = STATS_SCHEMA_VERSION
+            job.tracker_algorithm = "IoU-Centroid-Custom"
+            job.model_name = settings.YOLO_MODEL_NAME
+
+            # Legacy summary columns, kept in sync for existing readers.
             job.frames_sampled = len(sampled_frames)
             job.frames_with_detections = frames_with_dets
-            job.raw_detections = raw_detection_count
             job.stored_detections = len(final_detections)
             job.unique_tracks = len(track_summaries)
             job.unique_keyframes = len(keyframes_data)
             job.activity_intervals_count = len(motion_intervals)
-            job.tracker_algorithm = "IoU-Centroid-Custom"
-            job.model_name = settings.YOLO_MODEL_NAME
-            await db.commit()  # Commit diagnostic counters BEFORE reading stats
+            job.visual_attribute_observations = len(attr_observations)
+            job.vehicle_attribute_observations = vehicle_attr_count
+            job.plate_observations = plate_obs_count
+            job.track_attribute_aggregates = len(aggregates)
+            job.withheld_attributes = withheld_count
+            await db.commit()
 
-            logger.info(
-                f"[PIPELINE] job={job_id} frames_sampled={len(sampled_frames)} "
-                f"frames_with_detections={frames_with_dets} "
-                f"raw_detections={raw_detection_count} stored_detections={len(final_detections)} "
-                f"tracks={len(track_summaries)} keyframes={len(keyframes_data)} "
-                f"events={len(detected_events)} motion_intervals={len(motion_intervals)}"
-            )
+            canonical_stats = (await compute_analysis_statistics(db, job)).to_dict()
+            canonical_stats.pop("definitions", None)
+            logger.info(f"[PIPELINE] job={job_id} statistics={canonical_stats}")
 
-            stats = {
-                "job_id": job_id,
-                "total_frames_sampled": len(sampled_frames),
-                "frames_with_detections": frames_with_dets,
-                "raw_detections": raw_detection_count,
-                "total_detections": len(final_detections),
-                "total_tracks": len(track_summaries),
-                "total_keyframes": len(keyframes_data),
-                "total_events": len(detected_events),
-                "total_interactions": len(interactions),
-                "total_activity_intervals": len(motion_intervals)
-            }
-
+            # One timestamp for both the manifest and the job row, so the stored
+            # manifest and the job record describe the same moment.
+            finished_at = datetime.utcnow()
             manifest_dict, manifest_hash = ManifestGenerator.generate_manifest(
                 evidence_id=evidence.id,
                 analysis_job_id=job.id,
                 source_sha256=evidence.sha256_hash,
                 started_at=job.started_at,
-                completed_at=datetime.utcnow(),
+                completed_at=finished_at,
                 model_name=job.model_name,
                 model_version=job.model_version,
                 tracker_algorithm=job.tracker_algorithm,
                 sampling_fps=job.sampling_fps,
                 confidence_threshold=job.confidence_threshold,
-                stats=stats,
+                stats=canonical_stats,
                 keyframes=keyframes_data,
                 detections=final_detections,
                 tracks=track_summaries,
-                events=detected_events
+                events=detected_events,
+                capabilities=caps,
+            )
+            ManifestGenerator.save_manifest(
+                ManifestGenerator.manifest_path(evidence.id, job.id), manifest_dict
             )
 
             job.manifest_hash = manifest_hash
             job.status = JobStatus.COMPLETED
             job.progress = 100.0
-            job.completed_at = datetime.utcnow()
+            job.completed_at = finished_at
             evidence.status = EvidenceStatus.COMPLETED
 
             # Log audit record
@@ -394,3 +552,4 @@ async def run_analysis_job_async(job_id: int):
 
         finally:
             active_job_cancellations.discard(job_id)
+            running_analysis_jobs.discard(job_id)

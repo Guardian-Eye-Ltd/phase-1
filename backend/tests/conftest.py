@@ -1,3 +1,20 @@
+import atexit
+import os
+import shutil
+import tempfile
+
+# Isolate the whole test session BEFORE any app module is imported. Several
+# tests build their own client or use TestClient (which runs the app lifespan
+# and init_db), and the analysis runner opens its own SessionLocal — all of
+# which previously reached the developer's real guardianeye.db and storage/.
+# Environment variables take priority over backend/.env in pydantic-settings.
+_TEST_ROOT = tempfile.mkdtemp(prefix="guardianeye_test_").replace("\\", "/")
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_ROOT}/test.db"
+os.environ["STORAGE_DIR"] = os.path.join(_TEST_ROOT, "storage", "evidence")
+os.environ["DERIVED_STORAGE_DIR"] = os.path.join(_TEST_ROOT, "storage", "derived")
+os.environ["VECTOR_DB_PATH"] = os.path.join(_TEST_ROOT, "storage", "chroma_db")
+atexit.register(shutil.rmtree, _TEST_ROOT, True)
+
 import pytest
 import pytest_asyncio
 from typing import AsyncGenerator
@@ -9,6 +26,12 @@ from app.database.session import get_db
 from app.database.init_db import create_tables, seed_roles
 from app.models.role import Role
 from main import app
+from app.core.config import settings as _settings
+
+assert _settings.DATABASE_URL.startswith("sqlite") and _TEST_ROOT in _settings.DATABASE_URL, (
+    f"Test session is not isolated: DATABASE_URL={_settings.DATABASE_URL}"
+)
+assert _TEST_ROOT in os.path.abspath(_settings.STORAGE_DIR).replace("\\", "/"), "Test storage is not isolated"
 
 # In-memory SQLite async engine for isolated test environment
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"

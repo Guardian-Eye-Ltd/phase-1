@@ -80,7 +80,41 @@ export interface TimelineEvent {
     confidence?: number;
 }
 
+export interface EntityAttribute {
+    value: string;
+    confidence: number;
+    status: "OBSERVED" | "WITHHELD" | string;
+    supporting_count: number;
+    observation_count: number;
+    withheld_reason: string | null;
+}
+
+export interface Entity {
+    track_id: number;
+    class_name: string;
+    entity_type: "PERSON" | "VEHICLE" | "OBJECT";
+    first_seen: number;
+    last_seen: number;
+    duration: number;
+    observation_count: number;
+    attributes: Record<string, EntityAttribute>;
+    not_determined: Record<string, string>;
+}
+
+export interface EntitiesResponse {
+    evidence_id: number;
+    analysis_job_id: number;
+    attributes_extracted: boolean;
+    entities: Entity[];
+}
+
 export interface ManifestResponse {
     manifest_data: Record<string, any>;
     sha256_hash: string;
+    // SEALED: stored at analysis completion; RECONSTRUCTED: rebuilt for a run
+    // that predates sealed manifests and therefore cannot be verified.
+    source?: "SEALED" | "RECONSTRUCTED";
+    integrity_verified?: boolean;
+    recorded_hash?: string | null;
+    analysis_job_id?: number;
 }

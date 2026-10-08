@@ -1,7 +1,10 @@
 import json
 import hashlib
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+
+from app.core.config import settings
 
 class ManifestGenerator:
     """
@@ -26,7 +29,8 @@ class ManifestGenerator:
         tracks: Optional[List[Dict[str, Any]]] = None,
         attributes: Optional[List[Dict[str, Any]]] = None,
         relationships: Optional[List[Dict[str, Any]]] = None,
-        events: Optional[List[Dict[str, Any]]] = None
+        events: Optional[List[Dict[str, Any]]] = None,
+        capabilities: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         
         # Prepare structured detection records (capped at top 200 for clean manifest JSON size)
@@ -78,40 +82,30 @@ class ManifestGenerator:
                     "name": model_name,
                     "version": model_version,
                     "status": "USED",
-                    "frames_processed": stats.get("total_frames_sampled", 0),
-                    "detections": stats.get("total_detections", 0)
+                    "processed_frames": stats.get("processed_frames"),
+                    "stored_detections": stats.get("stored_detections"),
                 },
                 "tracker": {
                     "name": tracker_algorithm,
                     "status": "USED",
-                    "tracks": stats.get("total_tracks", 0)
+                    "unique_tracks": stats.get("unique_tracks"),
                 },
-                "open_vocab_detector": {
-                    "name": "OwlViT",
-                    "status": "NOT_USED",
-                    "reason": "No query-driven open-vocab concept specified"
-                },
-                "vlm_reasoning": {
-                    "name": "Ollama / Rule-Engine",
-                    "status": "RULE_ENGINE_USED"
-                }
             },
+
+            # What this run could actually do, resolved at run time. Replaces a
+            # previously hard-coded claim that a VLM/rule engine had been used.
+            "capabilities": capabilities or {},
 
             "sampling": {
                 "sampling_fps": sampling_fps,
                 "confidence_threshold": confidence_threshold,
-                "total_analysis_frames": stats.get("total_frames_sampled", 0)
+                "sampled_frames": stats.get("sampled_frames"),
             },
 
-            "statistics": {
-                "frames_processed": stats.get("total_frames_sampled", 0),
-                "detections": stats.get("total_detections", 0),
-                "tracks": stats.get("total_tracks", 0),
-                "keyframes": stats.get("total_keyframes", 0),
-                "events": stats.get("total_events", 0),
-                "interactions": stats.get("total_interactions", 0),
-                "activity_intervals": stats.get("total_activity_intervals", 0)
-            },
+            # Canonical AnalysisStatistics snapshot at completion. Semantic
+            # counts (VLM, documents) are filled in by indexing *after* the
+            # manifest is sealed; the live statistics endpoint has them.
+            "statistics": stats,
 
             "detections": formatted_detections,
             "tracks": formatted_tracks,
@@ -130,8 +124,31 @@ class ManifestGenerator:
             ]
         }
 
-        # Compute SHA-256 hash of deterministic JSON manifest
-        json_bytes = json.dumps(manifest_data, sort_keys=True).encode('utf-8')
-        manifest_hash = hashlib.sha256(json_bytes).hexdigest()
-
+        manifest_hash = hashlib.sha256(ManifestGenerator.canonical_bytes(manifest_data)).hexdigest()
         return manifest_data, manifest_hash
+
+    @staticmethod
+    def canonical_bytes(manifest_data: Dict[str, Any]) -> bytes:
+        """The exact byte representation that is hashed and stored."""
+        return json.dumps(manifest_data, sort_keys=True, default=str).encode("utf-8")
+
+    @staticmethod
+    def manifest_path(evidence_id: int, analysis_job_id: int) -> Path:
+        return Path(settings.DERIVED_STORAGE_DIR) / "manifests" / f"ev{evidence_id}_job{analysis_job_id}.json"
+
+    @staticmethod
+    def save_manifest(path: Path, manifest_data: Dict[str, Any]) -> None:
+        """
+        Persist the sealed manifest. Re-generating later from the database is not
+        equivalent — timestamps, ordering and run-time counters would differ and
+        the hash would never match the one recorded on the job.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(ManifestGenerator.canonical_bytes(manifest_data))
+
+    @staticmethod
+    def load_and_verify(path: Path, recorded_hash: Optional[str]) -> Tuple[Dict[str, Any], str, bool]:
+        """Return (manifest, sha256 of stored bytes, matches recorded hash)."""
+        raw = path.read_bytes()
+        actual = hashlib.sha256(raw).hexdigest()
+        return json.loads(raw), actual, bool(recorded_hash) and actual == recorded_hash

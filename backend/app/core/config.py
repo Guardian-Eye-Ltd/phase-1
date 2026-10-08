@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     YOLO_POSE_MODEL_NAME: str = "yolo11n-pose.pt"
     DETECTION_CONFIDENCE_THRESHOLD: float = 0.25
     DETECTION_IOU_THRESHOLD: float = 0.45
+    # The detector runs at this floor so pre-threshold box counts are measurable;
+    # the job's confidence threshold is then applied in Python.
+    DETECTOR_RAW_CONFIDENCE_FLOOR: float = 0.05
 
     # CLIP Attribute Engine & ALPR Config
     CLIP_MODEL_NAME: str = "openai/clip-vit-base-patch32"
@@ -63,6 +66,21 @@ class Settings(BaseSettings):
     MIN_SEARCH_RELEVANCE: float = 0.22
     LOITERING_THRESHOLD_SECONDS: float = 12.0
     CONCEALMENT_DISTANCE_THRESHOLD: float = 0.12  # Normalized keypoint wrist-to-hip distance
+
+    # Face recognition (InsightFace buffalo_l: SCRFD detection + ArcFace embeddings).
+    # Output is always a similarity candidate, never an identification.
+    FACE_RECOGNITION_ENABLED: bool = True
+    FACE_MODEL_PACK: str = "buffalo_l"
+    FACE_DET_SIZE: int = 640
+    FACE_MAX_FRAMES_PER_TRACK: int = 3       # faces are extracted from the best N frames per person track
+    FACE_MIN_SIZE_PX: int = 32               # measured in source-frame pixels, never after upscaling
+    FACE_MIN_DET_SCORE: float = 0.60
+    FACE_MIN_SHARPNESS: float = 10.0         # variance of Laplacian on a 112x112 face crop
+    FACE_MATCH_THRESHOLD: float = 0.45       # cosine similarity; same person ~0.9, strangers ~0.0 on probe data
+    FACE_QUERY_MAX_BYTES: int = 10 * 1024 * 1024
+    # Fernet key for embeddings at rest. If empty, a key is derived from
+    # SECRET_KEY (development only — set this explicitly in production).
+    FACE_EMBEDDING_KEY: str = ""
 
     # Agent & LLM Provider Config
     LLM_PROVIDER: str = "ollama"  # "ollama", "openai", "groq", "heuristics"

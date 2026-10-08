@@ -6,7 +6,8 @@ import {
     Keyframe,
     ActivityInterval,
     TimelineEvent,
-    ManifestResponse
+    ManifestResponse,
+    EntitiesResponse
 } from "../types/analysis";
 
 export const analysisService = {
@@ -69,6 +70,12 @@ export const analysisService = {
     // Manifest
     getManifest: async (evidenceId: number): Promise<ManifestResponse> => {
         const res = await apiClient.get(`/evidence/${evidenceId}/manifest`);
+        return res.data;
+    },
+
+    // Tracked people/vehicles with aggregated attributes and "not determined" reasons
+    getEntities: async (evidenceId: number): Promise<EntitiesResponse> => {
+        const res = await apiClient.get(`/evidence/${evidenceId}/entities`);
         return res.data;
     }
 };

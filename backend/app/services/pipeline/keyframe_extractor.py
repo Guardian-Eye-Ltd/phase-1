@@ -1,3 +1,4 @@
+import functools
 import os
 import cv2
 import hashlib
@@ -19,13 +20,15 @@ class KeyframeExtractor:
         all_detections: List[Dict[str, Any]],
         track_summaries: List[Dict[str, Any]],
         evidence_id: int,
-        derived_dir: str
+        derived_dir: str,
+        analysis_job_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not sampled_frames:
             return []
 
         target_dir = os.path.join(derived_dir, "keyframes", str(evidence_id))
         os.makedirs(target_dir, exist_ok=True)
+        save = functools.partial(KeyframeExtractor._save_keyframe, analysis_job_id=analysis_job_id)
 
         frames_dict = {fn: (ts, frame) for fn, ts, frame in sampled_frames}
         
@@ -49,7 +52,7 @@ class KeyframeExtractor:
                 selected_fns.add(first_fn)
                 ts, frame = frames_dict[first_fn]
                 reason = "PERSON_APPEARANCE" if cls_name == "person" else "OBJECT_DETECTION"
-                kf = KeyframeExtractor._save_keyframe(
+                kf = save(
                     frame, first_fn, ts, reason, evidence_id, target_dir, detections_by_frame.get(first_fn, [])
                 )
                 keyframes_list.append(kf)
@@ -58,7 +61,7 @@ class KeyframeExtractor:
             if last_fn in frames_dict and last_fn not in selected_fns:
                 selected_fns.add(last_fn)
                 ts, frame = frames_dict[last_fn]
-                kf = KeyframeExtractor._save_keyframe(
+                kf = save(
                     frame, last_fn, ts, "ENTRY_EXIT", evidence_id, target_dir, detections_by_frame.get(last_fn, [])
                 )
                 keyframes_list.append(kf)
@@ -72,7 +75,7 @@ class KeyframeExtractor:
                 if (ts - last_kf_ts) >= settings.KEYFRAME_INTERVAL:
                     if fn not in selected_fns:
                         selected_fns.add(fn)
-                        kf = KeyframeExtractor._save_keyframe(
+                        kf = save(
                             frame, fn, ts, "MOTION_CHANGE", evidence_id, target_dir, detections_by_frame.get(fn, [])
                         )
                         keyframes_list.append(kf)
@@ -83,7 +86,7 @@ class KeyframeExtractor:
         # 3. Fallback middle frame if no keyframes selected
         if not keyframes_list and sampled_frames:
             mid_fn, mid_ts, mid_frame = sampled_frames[len(sampled_frames) // 2]
-            kf = KeyframeExtractor._save_keyframe(
+            kf = save(
                 mid_frame, mid_fn, mid_ts, "MOTION_CHANGE", evidence_id, target_dir, detections_by_frame.get(mid_fn, [])
             )
             keyframes_list.append(kf)
@@ -109,9 +112,13 @@ class KeyframeExtractor:
         reason: str,
         evidence_id: int,
         target_dir: str,
-        frame_detections: List[Dict[str, Any]]
+        frame_detections: List[Dict[str, Any]],
+        analysis_job_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        file_basename = f"keyframe_ev{evidence_id}_fn{frame_number}.jpg"
+        # The job id is part of the name so two runs of the same evidence never
+        # overwrite (or, on deletion, remove) each other's keyframe images.
+        job_part = f"_job{analysis_job_id}" if analysis_job_id is not None else ""
+        file_basename = f"keyframe_ev{evidence_id}{job_part}_fn{frame_number}.jpg"
         full_path = os.path.join(target_dir, file_basename)
 
         # Save clean keyframe image file

@@ -32,8 +32,11 @@ import {
     FileCode,
     Image as ImageIcon,
     Activity as ActivityIcon,
-    Play
+    Play,
+    ScanFace
 } from "lucide-react";
+import { FaceSearchPanel } from "@/components/FaceSearchPanel";
+import { EntitiesPanel } from "@/components/EntitiesPanel";
 import { AnalysisModal } from "@/components/AnalysisModal";
 import { AnalysisProgress } from "@/components/AnalysisProgress";
 import { VideoOverlayPlayer, VideoOverlayPlayerRef } from "@/components/VideoOverlayPlayer";
@@ -58,7 +61,7 @@ export default function EvidenceDetailsPage() {
     const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
     const [manifest, setManifest] = useState<ManifestResponse | null>(null);
 
-    const [activeTab, setActiveTab] = useState<"overview" | "timeline" | "tracks" | "keyframes" | "activity" | "manifest">("overview");
+    const [activeTab, setActiveTab] = useState<"overview" | "timeline" | "tracks" | "faces" | "keyframes" | "activity" | "manifest">("overview");
 
     const playerRef = useRef<VideoOverlayPlayerRef>(null);
     const [streamUrl, setStreamUrl] = useState<string>("");
@@ -333,6 +336,7 @@ export default function EvidenceDetailsPage() {
                             { id: "overview", label: "Analysis Overview", icon: Sparkles },
                             { id: "timeline", label: `Timeline (${timeline.length})`, icon: Clock },
                             { id: "tracks", label: `People & Tracks (${tracks.length})`, icon: Crosshair },
+                            { id: "faces", label: "Face Search", icon: ScanFace },
                             { id: "keyframes", label: `Keyframes (${keyframes.length})`, icon: ImageIcon },
                             { id: "activity", label: `Activity (${activity.length})`, icon: ActivityIcon },
                             { id: "manifest", label: "Cryptographic Manifest", icon: FileCode },
@@ -444,39 +448,14 @@ export default function EvidenceDetailsPage() {
                         <div className="space-y-4">
                             <h3 className="text-sm font-bold text-white tracking-wide font-mono mb-4 flex items-center gap-2">
                                 <Crosshair className="w-4 h-4 text-emerald-400" />
-                                Tracked Persons & Entities
+                                People & Vehicles — observed attributes
                             </h3>
                             {tracks.length === 0 ? (
                                 <div className="text-center py-12 text-xs font-mono text-slate-500">
                                     No persistent tracks recorded yet.
                                 </div>
                             ) : (
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                    {tracks.map((t) => (
-                                        <div
-                                            key={t.id}
-                                            onClick={() => handleSeek(t.first_seen_timestamp)}
-                                            className="p-4 rounded-xl border border-slate-800 bg-[#070A11] hover:border-emerald-500/40 transition-all cursor-pointer space-y-3"
-                                        >
-                                            <div className="flex items-center justify-between">
-                                                <span className="text-xs font-bold font-mono text-emerald-400 uppercase">
-                                                    {t.class_name} #{t.track_number}
-                                                </span>
-                                                <span className="text-[10px] font-mono text-slate-400 bg-slate-900 px-2 py-0.5 rounded">
-                                                    {t.duration.toFixed(1)}s duration
-                                                </span>
-                                            </div>
-                                            <div className="text-xs text-slate-300 font-mono space-y-1">
-                                                <div>First Seen: {t.first_seen_timestamp.toFixed(2)}s (Frame #{t.first_seen_frame})</div>
-                                                <div>Last Seen: {t.last_seen_timestamp.toFixed(2)}s (Frame #{t.last_seen_frame})</div>
-                                                <div>Observations: {t.observation_count} frames</div>
-                                            </div>
-                                            <button className="w-full py-1.5 rounded text-xs font-mono bg-emerald-950 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-900 transition-colors flex items-center justify-center gap-1">
-                                                <Play className="w-3 h-3" /> Jump to Track Start
-                                            </button>
-                                        </div>
-                                    ))}
-                                </div>
+                                <EntitiesPanel evidenceId={evidenceId} onSeek={handleSeek} />
                             )}
                         </div>
                     )}
@@ -575,6 +554,10 @@ export default function EvidenceDetailsPage() {
                         </div>
                     )}
 
+                    {activeTab === "faces" && (
+                        <FaceSearchPanel evidenceId={evidenceId} onSeek={handleSeek} />
+                    )}
+
                     {/* TAB 6: CRYPTOGRAPHIC MANIFEST */}
                     {activeTab === "manifest" && (
                         <div className="space-y-4">
@@ -604,9 +587,25 @@ export default function EvidenceDetailsPage() {
                                 </div>
                             ) : (
                                 <div className="space-y-3">
-                                    <div className="p-3 bg-cyan-950/30 border border-cyan-900/40 rounded-lg text-xs font-mono text-cyan-300">
-                                        MANIFEST SHA-256 HASH: <span className="font-bold text-emerald-400">{manifest.sha256_hash}</span>
-                                    </div>
+                                    {manifest.source === "SEALED" && manifest.integrity_verified ? (
+                                        <div className="p-3 bg-emerald-950/30 border border-emerald-700/40 rounded-lg text-xs font-mono text-emerald-300 space-y-1">
+                                            <div className="font-bold">✓ INTEGRITY VERIFIED — analysis job #{manifest.analysis_job_id}</div>
+                                            <div>SHA-256: <span className="font-bold text-emerald-400 break-all">{manifest.sha256_hash}</span></div>
+                                            <div className="text-emerald-400/70">Matches the hash recorded when this analysis completed.</div>
+                                        </div>
+                                    ) : manifest.source === "SEALED" ? (
+                                        <div className="p-3 bg-rose-950/40 border border-rose-600/50 rounded-lg text-xs font-mono text-rose-300 space-y-1">
+                                            <div className="font-bold">✗ INTEGRITY FAILURE — the stored manifest does not match its recorded hash</div>
+                                            <div>Stored file: <span className="break-all">{manifest.sha256_hash}</span></div>
+                                            <div>Recorded: <span className="break-all">{manifest.recorded_hash ?? "none"}</span></div>
+                                        </div>
+                                    ) : (
+                                        <div className="p-3 bg-amber-950/30 border border-amber-700/40 rounded-lg text-xs font-mono text-amber-300 space-y-1">
+                                            <div className="font-bold">⚠ RECONSTRUCTED — cannot be verified</div>
+                                            <div>This analysis ran before manifests were sealed, so it was rebuilt from current records and its hash cannot match the one recorded at completion. Re-run analysis to obtain a verifiable manifest.</div>
+                                            <div className="text-amber-400/70 break-all">Reconstruction hash: {manifest.sha256_hash}</div>
+                                        </div>
+                                    )}
                                     <pre className="p-4 rounded-xl border border-slate-800 bg-[#070A11] text-xs font-mono text-slate-300 overflow-x-auto max-h-96">
                                         {JSON.stringify(manifest.manifest_data, null, 2)}
                                     </pre>

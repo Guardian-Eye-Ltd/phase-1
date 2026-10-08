@@ -70,6 +70,28 @@ class AnalysisJob(Base):
     unique_tracks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     unique_keyframes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     activity_intervals_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Extended statistics — each stage counted separately so a zero in one stage
+    # can be distinguished from a zero upstream.
+    source_frames: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processed_frames: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confidence_filtered_detections: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    class_filtered_detections: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Which definition set the run-time counters were written under; see
+    # analysis_statistics.STATS_SCHEMA_VERSION. 0 = legacy/unknown semantics.
+    stats_schema_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Face extraction outcome for this run: NOT_RUN | COMPLETED | UNAVAILABLE | FAILED.
+    # Lets a face search distinguish "no match" from "faces were never extracted".
+    face_stage: Mapped[str] = mapped_column(String(20), default="NOT_RUN", nullable=False)
+    face_stage_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    visual_attribute_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    vehicle_attribute_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    plate_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    track_attribute_aggregates: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    withheld_attributes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    event_candidates: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    semantic_documents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)

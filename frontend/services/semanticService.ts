@@ -85,9 +85,35 @@ export interface EnhancedTimelineResponse {
     timeline: EnhancedTimelineEvent[];
 }
 
+export interface InvestigationIntent {
+    type: string;                 // COUNT | FRAME_COUNT | SEARCH | ATTRIBUTE_SEARCH | EVENT_SEARCH | ...
+    entity?: string | null;
+    scope?: string | null;
+    aggregation?: string | null;
+    timestamp?: number | null;
+    attributes?: Record<string, any>;
+    event_type?: string | null;
+}
+
+export interface CountResult {
+    total?: number;              // present for COUNT
+    count?: number;              // present for FRAME_COUNT
+    breakdown?: Record<string, number>;
+    track_ids?: number[];
+}
+
+export interface InvestigationVerification {
+    status: string;              // SUPPORTED | WITHHELD | ...
+    verification_type?: string;
+    evidence_basis?: string;
+    analysis_job_id?: number | null;
+    checks?: Record<string, boolean>;
+}
+
 export interface AgentInvestigationResponse {
     investigation_id: string;
     evidence_id: number;
+    analysis_job_id?: number | null;
     query: string;
     status: string;
     execution_time_ms: number;
@@ -96,6 +122,14 @@ export interface AgentInvestigationResponse {
     events: Array<Record<string, any>>;
     findings: SearchResultItem[];
     report_markdown: string;
+
+    // Intent-first fields (COUNT / FRAME_COUNT / ...). Optional for backward
+    // compatibility with older responses.
+    intent?: InvestigationIntent;
+    result?: CountResult;
+    evidence_basis?: { primary?: string; secondary?: string[] };
+    verification?: InvestigationVerification;
+    diagnostic?: Record<string, any>;
 }
 
 export const semanticService = {

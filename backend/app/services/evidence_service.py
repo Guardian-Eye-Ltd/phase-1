@@ -18,36 +18,6 @@ class EvidenceService:
     """
 
     @staticmethod
-    async def process_background_pipeline(evidence_id: int):
-        """
-        Simulates background video processing pipeline (Celery / Redis / RQ mock).
-        Transitions state: UPLOADED -> QUEUED -> PROCESSING -> COMPLETED.
-        """
-        await asyncio.sleep(1)
-        async with SessionLocal() as db:
-            result = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
-            evidence = result.scalar_one_or_none()
-            if evidence:
-                evidence.status = EvidenceStatus.QUEUED
-                await db.commit()
-
-        await asyncio.sleep(2)
-        async with SessionLocal() as db:
-            result = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
-            evidence = result.scalar_one_or_none()
-            if evidence:
-                evidence.status = EvidenceStatus.PROCESSING
-                await db.commit()
-
-        await asyncio.sleep(3)
-        async with SessionLocal() as db:
-            result = await db.execute(select(Evidence).where(Evidence.id == evidence_id))
-            evidence = result.scalar_one_or_none()
-            if evidence:
-                evidence.status = EvidenceStatus.COMPLETED
-                await db.commit()
-
-    @staticmethod
     async def upload_evidence(
         db: AsyncSession,
         file: UploadFile,

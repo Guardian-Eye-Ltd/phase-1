@@ -1,5 +1,6 @@
 import logging
 import math
+import cv2
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 from app.core.config import settings

@@ -1,13 +1,5 @@
-from app.services.agents.llm_provider import LLMProvider
-from app.services.agents.investigation_tools import InvestigationToolSystem
-from app.services.agents.evidence_verifier import EvidenceVerifier
-from app.services.agents.report_generator import ForensicReportGenerator
-from app.services.agents.investigation_orchestrator import InvestigationOrchestrator
-
-__all__ = [
-    "LLMProvider",
-    "InvestigationToolSystem",
-    "EvidenceVerifier",
-    "ForensicReportGenerator",
-    "InvestigationOrchestrator"
-]
+"""
+Agents package. Keep this __init__.py free of eager submodule imports so that
+cross-package imports (e.g. query_parser -> taxonomy) do not create cycles
+through investigation_tools -> hybrid_search_engine -> query_parser.
+"""

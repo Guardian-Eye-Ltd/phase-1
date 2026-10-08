@@ -6,7 +6,8 @@ from PIL import Image
 from typing import List, Dict, Any, Tuple, Optional
 from transformers import CLIPProcessor, CLIPModel
 from app.core.config import settings
-from app.services.pipeline.alpr_service import ALPRService
+from app.services.pipeline.attribute_extractor import associate_carried_items, enrich_detection
+from app.services.pipeline.body_regions import match_pose_to_boxes
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,6 @@ _DET_MODEL = None
 _POSE_MODEL = None
 _CLIP_MODEL = None
 _CLIP_PROCESSOR = None
-
-COLOR_LABELS = ["black", "white", "silver", "grey", "red", "blue", "green", "yellow", "brown"]
-HEADWEAR_LABELS = ["hat", "cap", "helmet", "bare head"]
-CARRIED_LABELS = ["backpack", "handbag", "suitcase", "box", "none"]
-VEHICLE_BODY_LABELS = ["sedan", "SUV", "pickup truck", "hatchback", "truck", "van", "motorcycle"]
-UPPER_GARMENT_LABELS = ["t-shirt", "jacket", "coat", "hoodie", "shirt", "sweater"]
-LOWER_GARMENT_LABELS = ["jeans", "pants", "shorts", "skirt"]
 
 def get_models():
     """Lazily loads and caches YOLO detection, YOLO pose, and OpenCLIP models."""
@@ -56,98 +50,6 @@ def get_models():
 
     return _DET_MODEL, _POSE_MODEL, _CLIP_MODEL, _CLIP_PROCESSOR
 
-def classify_crop_clip(crop_bgr: np.ndarray, labels: List[str]) -> Tuple[str, float]:
-    """Zero-shot neural classification over image crops using OpenCLIP."""
-    if crop_bgr is None or crop_bgr.size == 0 or not labels:
-        return "unknown", 0.0
-    try:
-        _, _, clip_model, clip_proc = get_models()
-        if clip_model is None or clip_proc is None:
-            return "unknown", 0.0
-
-        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb)
-        
-        # Format labels into structured prompts for enhanced CLIP accuracy
-        text_prompts = [f"a photo of a {label}" for label in labels]
-        
-        inputs = clip_proc(text=text_prompts, images=pil_img, return_tensors="pt", padding=True).to(settings.DEVICE)
-        with torch.no_grad():
-            outputs = clip_model(**inputs)
-            probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
-            best_idx = int(np.argmax(probs))
-            return labels[best_idx], float(probs[best_idx])
-    except Exception as e:
-        logger.warning(f"[CLIP] Attribute inference error: {e}")
-        return "unknown", 0.0
-
-def enrich_detections_with_attributes(
-    frame: np.ndarray, 
-    detections: List[Dict[str, Any]],
-    pose_keypoints_by_box: Optional[Dict[int, np.ndarray]] = None
-) -> List[Dict[str, Any]]:
-    """
-    Enriches detected bounding boxes with OpenCLIP fine-grained entity attributes,
-    PaddleOCR ALPR license plate extraction, and pose keypoint landmarks.
-    """
-    if not detections or frame is None:
-        return detections
-
-    h, w = frame.shape[:2]
-
-    for idx, det in enumerate(detections):
-        x1 = max(0, int(det["bbox_x1"] * w))
-        y1 = max(0, int(det["bbox_y1"] * h))
-        x2 = min(w, int(det["bbox_x2"] * w))
-        y2 = min(h, int(det["bbox_y2"] * h))
-        
-        crop_h = y2 - y1
-        crop_w = x2 - x1
-        
-        if crop_h > 15 and crop_w > 15:
-            crop = frame[y1:y2, x1:x2]
-            
-            if det["class_name"] == "person":
-                upper_crop = crop[int(crop_h * 0.10):int(crop_h * 0.50), :]
-                lower_crop = crop[int(crop_h * 0.50):int(crop_h * 0.90), :]
-                head_crop = crop[0:int(crop_h * 0.25), :]
-                
-                # Zero-shot OpenCLIP attribute classification
-                if settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
-                    upper_color, _ = classify_crop_clip(upper_crop, COLOR_LABELS)
-                    lower_color, _ = classify_crop_clip(lower_crop, COLOR_LABELS)
-                    upper_type, _ = classify_crop_clip(upper_crop, UPPER_GARMENT_LABELS)
-                    lower_type, _ = classify_crop_clip(lower_crop, LOWER_GARMENT_LABELS)
-                    headwear, _ = classify_crop_clip(head_crop, HEADWEAR_LABELS)
-                    carried_item, _ = classify_crop_clip(crop, CARRIED_LABELS)
-                    
-                    det["upper_garment_color"] = upper_color
-                    det["lower_garment_color"] = lower_color
-                    det["upper_garment_type"] = upper_type
-                    det["lower_garment_type"] = lower_type
-                    det["headwear"] = headwear
-                    det["carries_bag"] = carried_item in ["backpack", "handbag", "suitcase", "box"]
-                    det["carried_item"] = carried_item
-
-                # Attach Pose Keypoints if available
-                if pose_keypoints_by_box and idx in pose_keypoints_by_box:
-                    det["keypoints"] = pose_keypoints_by_box[idx].tolist()
-                
-            elif det["class_name"] in ["car", "motorcycle", "bicycle", "bus", "truck"]:
-                if settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
-                    v_color, _ = classify_crop_clip(crop, COLOR_LABELS)
-                    v_body, _ = classify_crop_clip(crop, VEHICLE_BODY_LABELS)
-                    det["vehicle_color"] = v_color
-                    det["vehicle_body_style"] = v_body
-
-                # ALPR License Plate Extraction via PaddleOCR / ALPRService
-                if settings.ENABLE_ALPR:
-                    plate_num = ALPRService.extract_license_plate(crop)
-                    if plate_num:
-                        det["license_plate_number"] = plate_num
-
-    return detections
-
 class ObjectDetector:
     def __init__(
         self,
@@ -163,6 +65,7 @@ class ObjectDetector:
         det_model, pose_model, _, _ = get_models()
         self.yolo_model = det_model
         self.pose_model = pose_model
+        self.last_diagnostics: Dict[str, int] = {}
 
     def preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, int, int]:
         orig_h, orig_w = frame.shape[:2]
@@ -189,6 +92,17 @@ class ObjectDetector:
         num_frames = len(sampled_frames)
         logger.info(f"[DETECTION] Executing YOLO batch detection on {num_frames} frames (batch_size={batch_size})...")
 
+        # The model runs at a low floor and the job threshold is applied here, so
+        # every filtering stage is countable. NMS keeps higher-confidence boxes
+        # first, so the set of boxes above the threshold is unchanged.
+        model_conf = min(settings.DETECTOR_RAW_CONFIDENCE_FLOOR, self.confidence_threshold)
+        diag = {
+            "processed_frames": 0,
+            "raw_model_detections": 0,
+            "confidence_filtered_detections": 0,
+            "class_filtered_detections": 0,
+        }
+
         for i in range(0, num_frames, batch_size):
             batch = sampled_frames[i : i + batch_size]
             processed_frames = []
@@ -202,11 +116,12 @@ class ObjectDetector:
             # Run Primary Bounding Box Detection
             results = self.yolo_model.predict(
                 processed_frames,
-                conf=self.confidence_threshold,
+                conf=model_conf,
                 iou=self.iou_threshold,
                 device=settings.DEVICE,
                 verbose=False
             )
+            diag["processed_frames"] += len(processed_frames)
 
             # Optional Pose Estimation pass for keypoint extraction
             pose_results = None
@@ -224,28 +139,38 @@ class ObjectDetector:
             for b_idx, (result, (fn, ts, orig_w, orig_h, raw_frame)) in enumerate(zip(results, frame_meta)):
                 boxes = result.boxes
                 p_h, p_w = result.orig_shape[:2]
+                sx, sy = orig_w / float(p_w), orig_h / float(p_h)
                 frame_dets = []
-                pose_map: Dict[int, np.ndarray] = {}
 
-                # Match pose keypoints to person boxes in this frame
+                # Pose detections in original-frame pixels. They are matched to
+                # person boxes by IoU below — the two models do not list people
+                # in the same order, so index-based pairing attached one
+                # person's keypoints to another.
+                pose_boxes, pose_kps, pose_conf = [], None, None
                 if pose_results and b_idx < len(pose_results):
                     pose_res = pose_results[b_idx]
-                    if hasattr(pose_res, "keypoints") and pose_res.keypoints is not None:
-                        try:
-                            kp_data = pose_res.keypoints.xyn.cpu().numpy() # (N, 17, 2)
-                            for k_idx, kp in enumerate(kp_data):
-                                pose_map[k_idx] = kp
-                        except Exception:
-                            pass
-
-                person_det_counter = 0
+                    try:
+                        if pose_res.boxes is not None and pose_res.keypoints is not None and len(pose_res.boxes):
+                            pb = pose_res.boxes.xyxy.cpu().numpy()
+                            pose_boxes = [(b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in pb]
+                            pose_kps = pose_res.keypoints.xy.cpu().numpy() * np.array([sx, sy])
+                            if pose_res.keypoints.conf is not None:
+                                pose_conf = pose_res.keypoints.conf.cpu().numpy()
+                    except Exception as pe:
+                        logger.warning(f"[POSE] Could not read pose output: {pe}")
 
                 for box in boxes:
                     cls_id = int(box.cls[0])
                     cls_name = result.names[cls_id].lower().strip()
                     conf = float(box.conf[0])
 
+                    diag["raw_model_detections"] += 1
+                    if conf < self.confidence_threshold:
+                        continue
+                    diag["confidence_filtered_detections"] += 1
+
                     if cls_name in TARGET_CLASSES:
+                        diag["class_filtered_detections"] += 1
                         xyxy = box.xyxy[0].tolist()
                         
                         # Preserve forensic precision by mapping normalized coordinates
@@ -264,27 +189,35 @@ class ObjectDetector:
                             "bbox_y1": round(orig_y1 / float(orig_h), 4),
                             "bbox_x2": round(orig_x2 / float(orig_w), 4),
                             "bbox_y2": round(orig_y2 / float(orig_h), 4),
-                            "upper_garment_color": "unknown",
-                            "lower_garment_color": "unknown",
-                            "upper_garment_type": "unknown",
-                            "lower_garment_type": "unknown",
-                            "headwear": "unknown",
-                            "vehicle_color": "unknown",
-                            "vehicle_body_style": "unknown",
-                            "license_plate_number": None,
-                            "carries_bag": False,
-                            "keypoints": None
+                            # Attributes are only ever set by the extractor;
+                            # absence means "not determined", never a default.
+                            "carries_bag": None,
+                            "keypoints": None,
+                            "_box_px": (orig_x1, orig_y1, orig_x2, orig_y2),
                         }
-
-                        if cls_name == "person":
-                            if person_det_counter in pose_map:
-                                det_entry["keypoints"] = pose_map[person_det_counter].tolist()
-                            person_det_counter += 1
-
                         frame_dets.append(det_entry)
 
-                enriched = enrich_detections_with_attributes(raw_frame, frame_dets)
-                all_detections.extend(enriched)
+                persons = [d for d in frame_dets if d["class_name"] == "person"]
+                assignment = match_pose_to_boxes([d["_box_px"] for d in persons], pose_boxes)
+                pose_for = {id(d): j for d, j in zip(persons, assignment)}
 
-        logger.info(f"[DETECTION] Completed detection: {len(all_detections)} validated forensic entities identified.")
+                for det_entry in frame_dets:
+                    j = pose_for.get(id(det_entry))
+                    kps = pose_kps[j] if (j is not None and pose_kps is not None) else None
+                    kconf = pose_conf[j] if (j is not None and pose_conf is not None) else None
+                    if kps is not None:
+                        # Normalised keypoints are what EventEngine consumes.
+                        det_entry["keypoints"] = (kps / np.array([orig_w, orig_h])).tolist()
+                    enrich_detection(raw_frame, det_entry, kps, kconf)
+                    del det_entry["_box_px"]
+                associate_carried_items(frame_dets)
+                all_detections.extend(frame_dets)
+
+        self.last_diagnostics = diag
+        logger.info(
+            "[DETECTION] frames=%d raw=%d conf_filtered=%d class_filtered=%d (threshold=%.2f, model_conf=%.2f)",
+            diag["processed_frames"], diag["raw_model_detections"],
+            diag["confidence_filtered_detections"], diag["class_filtered_detections"],
+            self.confidence_threshold, model_conf,
+        )
         return all_detections

@@ -1,169 +1,270 @@
+"""
+Licence-plate reading per vehicle *track*.
+
+Pipeline: pick the largest few frames of each vehicle track → lower part of
+the vehicle crop (where plates sit) → contrast enhancement → EasyOCR (its own
+text detector locates the plate characters) → normalise + validate format →
+character-level voting across frames.
+
+A plate is only asserted when several reads agree on every character; one
+read, or reads that disagree on any position, are WITHHELD — the system never
+fills in characters it did not see consistently.
+"""
+import logging
+import re
+import threading
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import re
-import logging
-from typing import Optional
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Lazy initialization of OCR readers
-_PADDLE_OCR = None
-_EASY_OCR = None
-_OCR_ATTEMPTED = False
+PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# Indian formats: KL01AB1234 style and Bharat series 22BH1234AB.
+INDIAN_PLATE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{1,4}$|^\d{2}BH\d{4}[A-Z]{1,2}$")
+MIN_VEHICLE_WIDTH_FOR_OCR_PX = 120
+MAX_FRAMES_PER_TRACK = 4
+MIN_SECONDS_BETWEEN_SAMPLES = 0.5
+# Measured on synthetic plates: reads of plates narrower than ~80px came back
+# wrong at OCR confidence 0.08-0.25; correct reads were 0.67-0.98.
+MIN_READ_CONFIDENCE = 0.35
 
-def _init_ocr_engine():
-    global _PADDLE_OCR, _EASY_OCR, _OCR_ATTEMPTED
-    if _OCR_ATTEMPTED:
-        return
-    _OCR_ATTEMPTED = True
-    
-    try:
-        from paddleocr import PaddleOCR
-        logger.info("[ALPR] Initializing PaddleOCR engine...")
-        _PADDLE_OCR = PaddleOCR(use_angle_cls=False, lang='en', show_log=False)
-        logger.info("[ALPR] PaddleOCR initialized successfully.")
-        return
-    except Exception as e:
-        logger.debug(f"[ALPR] PaddleOCR not available ({e}). Trying EasyOCR...")
+# Visually confusable glyphs, used only to fit a read to the registered format.
+_TO_DIGIT = {"O": "0", "D": "0", "Q": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "G": "6", "B": "8", "T": "7"}
+_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "6": "G", "8": "B", "7": "T", "4": "A"}
 
-    try:
-        import easyocr
-        logger.info("[ALPR] Initializing EasyOCR engine...")
-        _EASY_OCR = easyocr.Reader(['en'], gpu=False)
-        logger.info("[ALPR] EasyOCR initialized successfully.")
-    except Exception as e:
-        logger.warning(f"[ALPR] OCR engines (PaddleOCR / EasyOCR) unavailable ({e}). Fallback mode active.")
+_reader = None
+_reader_error: Optional[str] = None
+_lock = threading.Lock()
 
-class ALPRService:
+
+def _get_reader():
+    global _reader, _reader_error
+    if _reader is not None or _reader_error is not None:
+        return _reader
+    with _lock:
+        if _reader is None and _reader_error is None:
+            try:
+                import easyocr
+                _reader = easyocr.Reader(["en"], gpu=settings.DEVICE != "cpu", verbose=False)
+                logger.info("[ALPR] EasyOCR ready.")
+            except Exception as e:
+                _reader_error = f"{type(e).__name__}: {e}"
+                logger.warning(f"[ALPR] OCR unavailable: {_reader_error}")
+    return _reader
+
+
+@dataclass
+class PlateRead:
+    text: str               # normalised A-Z0-9
+    raw_text: str
+    ocr_confidence: float
+    validation_score: float  # 1.0 known format, 0.7 letters+digits, 0.4 digits only
+
+    @property
+    def score(self) -> float:
+        return self.ocr_confidence * self.validation_score
+
+
+def normalise_plate(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def correct_to_indian_format(text: str, max_substitutions: int = 3) -> Optional[str]:
     """
-    Automatic License Plate Recognition (ALPR) Service.
-    Extracts license plate crops, applies adaptive thresholding, runs OCR,
-    and validates text against standard alphanumeric patterns.
+    Fit an OCR read to the Indian plate format by swapping only visually
+    confusable glyphs (O<->0, I<->1, B<->8, ...). Returns the corrected string
+    with the fewest substitutions, or None if no such fit exists. Nothing is
+    inserted or deleted: a character that was not read is never invented.
     """
-
-    PLATE_REGEX = re.compile(r"^[A-Z0-9\-\s]{4,12}$")
-
-    @classmethod
-    def preprocess_plate_crop(cls, crop_bgr: np.ndarray) -> np.ndarray:
-        """
-        Enhances contrast and cleans plate image via adaptive thresholding.
-        """
-        if crop_bgr is None or crop_bgr.size == 0:
-            return crop_bgr
-
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        
-        # Resize to standard height for OCR stability
-        h, w = gray.shape[:2]
-        if h < 60:
-            scale = 60.0 / float(h)
-            gray = cv2.resize(gray, (int(w * scale), 60), interpolation=cv2.INTER_CUBIC)
-
-        # Bilateral filter to reduce noise while preserving edges
-        filtered = cv2.bilateralFilter(gray, 11, 17, 17)
-
-        # Adaptive thresholding to enhance high-contrast text
-        binary = cv2.adaptiveThreshold(
-            filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        return binary
-
-    @classmethod
-    def locate_plate_region(cls, vehicle_crop: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Locates license plate candidate region within a vehicle crop using aspect ratio & contour analysis.
-        """
-        if vehicle_crop is None or vehicle_crop.size == 0:
-            return None
-
-        h, w = vehicle_crop.shape[:2]
-        gray = cv2.cvtColor(vehicle_crop, cv2.COLOR_BGR2GRAY)
-        
-        # Plate candidate heuristic focusing on lower 60% of vehicle box
-        roi_y1 = int(h * 0.35)
-        roi = gray[roi_y1:h, :]
-        
-        # Edge detection for plate localization
-        grad_x = cv2.Sobel(roi, cv2.CV_8U, 1, 0, ksize=3)
-        _, thresh = cv2.threshold(grad_x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_plate_crop = None
-        max_area = 0
-        
-        for cnt in contours:
-            rect = cv2.minAreaRect(cnt)
-            (cx, cy), (rw, rh), angle = rect
-            if rw == 0 or rh == 0:
+    if INDIAN_PLATE.match(text):
+        return text
+    n = len(text)
+    # Structure: 2 letters, 1-2 digits, 0-3 letters, 1-4 digits.
+    for d1 in (2, 1):
+        for l2 in range(0, 4):
+            d2 = n - 2 - d1 - l2
+            if not (1 <= d2 <= 4):
                 continue
-            aspect = max(rw, rh) / min(rw, rh)
-            area = rw * rh
-            
-            # Typical license plate aspect ratio is between 2.0 and 6.0
-            if 2.0 <= aspect <= 6.5 and area > 400 and area > max_area:
-                max_area = area
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                best_plate_crop = vehicle_crop[roi_y1 + by : roi_y1 + by + bh, bx : bx + bw]
-                
-        return best_plate_crop if best_plate_crop is not None else vehicle_crop
+            pattern = "L" * 2 + "D" * d1 + "L" * l2 + "D" * d2
+            out, subs = [], 0
+            for ch, want in zip(text, pattern):
+                if want == "D" and not ch.isdigit():
+                    if ch not in _TO_DIGIT:
+                        break
+                    ch, subs = _TO_DIGIT[ch], subs + 1
+                elif want == "L" and not ch.isalpha():
+                    if ch not in _TO_LETTER:
+                        break
+                    ch, subs = _TO_LETTER[ch], subs + 1
+                out.append(ch)
+            else:
+                if subs <= max_substitutions and INDIAN_PLATE.match("".join(out)):
+                    return "".join(out)
+    return None
 
-    @classmethod
-    def extract_license_plate(cls, vehicle_crop: np.ndarray) -> Optional[str]:
-        """
-        Runs full ALPR pipeline on a vehicle crop and returns sanitized plate string or None.
-        """
-        if vehicle_crop is None or vehicle_crop.size == 0:
-            return None
 
-        _init_ocr_engine()
+def validation_score(text: str) -> float:
+    if not (4 <= len(text) <= 10) or not re.search(r"\d", text):
+        return 0.0
+    if INDIAN_PLATE.match(text):
+        return 1.0
+    return 0.7 if re.search(r"[A-Z]", text) else 0.4
 
-        plate_region = cls.locate_plate_region(vehicle_crop)
-        if plate_region is None:
-            plate_region = vehicle_crop
 
-        binary_plate = cls.preprocess_plate_crop(plate_region)
+def _merge_line_fragments(results) -> List[Tuple[str, float]]:
+    """EasyOCR often splits a plate into pieces; join fragments on the same line."""
+    items = []
+    for box, text, conf in results:
+        xs = [p[0] for p in box]; ys = [p[1] for p in box]
+        items.append({"x1": min(xs), "x2": max(xs), "cy": (min(ys) + max(ys)) / 2,
+                      "h": max(ys) - min(ys), "text": text, "conf": float(conf)})
+    items.sort(key=lambda i: (round(i["cy"] / max(i["h"], 1)), i["x1"]))
+    lines: List[List[dict]] = []
+    for it in items:
+        if lines and abs(lines[-1][-1]["cy"] - it["cy"]) < 0.6 * max(it["h"], lines[-1][-1]["h"]) \
+                and it["x1"] - lines[-1][-1]["x2"] < 1.5 * it["h"]:
+            lines[-1].append(it)
+        else:
+            lines.append([it])
+    out = []
+    for line in lines:
+        out.append(("".join(i["text"] for i in line), float(np.mean([i["conf"] for i in line]))))
+        out.extend((i["text"], i["conf"]) for i in line if len(line) > 1)
+    return out
 
-        raw_text = ""
 
-        # 1. Try PaddleOCR
-        if _PADDLE_OCR is not None:
-            try:
-                res = _PADDLE_OCR.ocr(binary_plate, cls=False)
-                if res and res[0]:
-                    lines = [line[1][0] for line in res[0] if line and line[1]]
-                    raw_text = " ".join(lines)
-            except Exception as e:
-                logger.debug(f"[ALPR] PaddleOCR recognition error: {e}")
+def read_plate_candidates(vehicle_crop: np.ndarray) -> List[PlateRead]:
+    """All plausible plate strings in one vehicle crop, best first."""
+    reader = _get_reader()
+    if reader is None or vehicle_crop is None or vehicle_crop.size == 0:
+        return []
+    h, w = vehicle_crop.shape[:2]
+    region = vehicle_crop[int(0.35 * h):, :]
+    scale = min(3.0, max(1.0, 640.0 / max(w, 1)))
+    region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
-        # 2. Try EasyOCR if PaddleOCR failed or unavailable
-        if not raw_text and _EASY_OCR is not None:
-            try:
-                res = _EASY_OCR.readtext(binary_plate)
-                if res:
-                    raw_text = " ".join([r[1] for r in res])
-            except Exception as e:
-                logger.debug(f"[ALPR] EasyOCR recognition error: {e}")
+    results = reader.readtext(gray, allowlist=PLATE_ALLOWLIST, detail=1, paragraph=False)
+    reads = []
+    for raw, conf in _merge_line_fragments(results):
+        if conf < MIN_READ_CONFIDENCE:
+            continue
+        text = normalise_plate(raw)
+        corrected = correct_to_indian_format(text) if 8 <= len(text) <= 10 else None
+        if corrected:
+            text = corrected
+        v = validation_score(text)
+        if v > 0:
+            reads.append(PlateRead(text, raw, round(conf, 4), v))
+    reads.sort(key=lambda r: r.score, reverse=True)
+    return reads
 
-        if not raw_text:
-            return None
 
-        # Sanitize and format
-        clean_text = re.sub(r"[^A-Z0-9\-\s]", "", raw_text.upper()).strip()
-        clean_text = re.sub(r"\s+", " ", clean_text)
+def vote_plate(reads: List[Tuple[str, float]], min_reads: int = 2,
+               min_position_majority: float = 0.6) -> Dict[str, Any]:
+    """
+    Character-level consensus over (text, confidence) reads of one vehicle.
 
-        if cls.PLATE_REGEX.match(clean_text):
-            logger.info(f"[ALPR] Extracted valid license plate: '{clean_text}'")
-            return clean_text
+    Withheld unless at least `min_reads` reads share the winning length and
+    every character position has a clear (>= min_position_majority) majority.
+    """
+    if not reads:
+        return {"value": None, "status": "WITHHELD", "reason": "no reads"}
+    lengths = Counter(len(t) for t, _ in reads)
+    best_len = max(lengths, key=lambda L: (lengths[L], sum(c for t, c in reads if len(t) == L)))
+    same = [(t, c) for t, c in reads if len(t) == best_len]
 
-        # Secondary fallback: match substrings
-        matches = re.findall(r"[A-Z0-9]{4,10}", clean_text.replace(" ", "").replace("-", ""))
-        if matches:
-            plate_candidate = matches[0]
-            logger.info(f"[ALPR] Extracted sanitized license plate candidate: '{plate_candidate}'")
-            return plate_candidate
+    consensus, fractions = [], []
+    for i in range(best_len):
+        weights: Dict[str, float] = defaultdict(float)
+        for t, c in same:
+            weights[t[i]] += max(c, 1e-3)
+        ch, wt = max(weights.items(), key=lambda kv: kv[1])
+        consensus.append(ch)
+        fractions.append(wt / sum(weights.values()))
+    value = "".join(consensus)
+    agreement = float(np.mean(fractions))
+    mean_conf = float(np.mean([c for _, c in same]))
+    exact = sum(1 for t, _ in same if t == value)
+    confidence = agreement * mean_conf * min(1.0, len(same) / 3.0)
 
-        return None
+    if len(same) < min_reads:
+        status, reason = "WITHHELD", f"only {len(same)} read(s) of this length"
+    elif min(fractions) < min_position_majority:
+        status, reason = "WITHHELD", "reads disagree on at least one character"
+    else:
+        status, reason = "OBSERVED", ""
+    return {
+        "value": value, "status": status, "reason": reason,
+        "confidence": round(confidence, 4), "agreement": round(agreement, 4),
+        "reads_considered": len(same), "reads_total": len(reads), "exact_matches": exact,
+        "min_position_majority": round(min(fractions), 4),
+    }
+
+
+def _best_frames(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked = sorted(dets, key=lambda d: (d["bbox_x2"] - d["bbox_x1"]) * (d["bbox_y2"] - d["bbox_y1"]), reverse=True)
+    chosen: List[Dict[str, Any]] = []
+    for d in ranked:
+        if all(abs(d["timestamp"] - c["timestamp"]) >= MIN_SECONDS_BETWEEN_SAMPLES for c in chosen):
+            chosen.append(d)
+        if len(chosen) >= MAX_FRAMES_PER_TRACK:
+            break
+    return chosen
+
+
+def read_vehicle_plates(
+    sampled_frames: List[Tuple[int, float, np.ndarray]],
+    detections: List[Dict[str, Any]],
+    vehicle_classes=("car", "truck", "bus", "motorcycle", "van"),
+    read_fn=read_plate_candidates,
+) -> List[Dict[str, Any]]:
+    """One license_plate_text observation per (vehicle track, frame) that yielded a plausible read."""
+    frames = {fn: frame for fn, _, frame in sampled_frames}
+    by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for d in detections:
+        if d.get("class_name") in vehicle_classes and d.get("track_id") is not None and d["frame_number"] in frames:
+            by_track[d["track_id"]].append(d)
+
+    observations = []
+    ocr_runs = skipped_small = 0
+    for track_id, dets in by_track.items():
+        for rank, d in enumerate(_best_frames(dets)):
+            frame = frames[d["frame_number"]]
+            fh, fw = frame.shape[:2]
+            x1, y1 = int(d["bbox_x1"] * fw), int(d["bbox_y1"] * fh)
+            x2, y2 = int(d["bbox_x2"] * fw), int(d["bbox_y2"] * fh)
+            if x2 - x1 < MIN_VEHICLE_WIDTH_FOR_OCR_PX:
+                skipped_small += 1
+                continue
+            ocr_runs += 1
+            reads = read_fn(frame[max(0, y1):y2, max(0, x1):x2])
+            if not reads:
+                # Frames are tried largest first; if the clearest view shows
+                # no plate text, smaller views will not (saves ~3 s per frame).
+                if rank == 0:
+                    break
+                continue
+            best = reads[0]
+            observations.append({
+                "track_number": track_id,
+                "entity_type": "VEHICLE",
+                "attribute": "license_plate_text",
+                "value": best.text,
+                "confidence": round(best.score, 4),
+                "frame_number": d["frame_number"],
+                "timestamp": float(d["timestamp"]),
+                "source": "ALPR_OCR",
+            })
+    logger.info(
+        f"[ALPR] vehicle_tracks={len(by_track)} ocr_runs={ocr_runs} "
+        f"skipped_too_small={skipped_small} plate_reads={len(observations)}"
+    )
+    return observations

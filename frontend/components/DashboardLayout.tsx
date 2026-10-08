@@ -3,7 +3,7 @@
 import React from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import ProtectedRoute from "./ProtectedRoute";
-import { LogOut, LayoutDashboard, Film, UploadCloud, ShieldCheck, Activity, FileText, Sparkles } from "lucide-react";
+import { LogOut, LayoutDashboard, Film, UploadCloud, ShieldCheck, Activity, FileText, Sparkles, Settings } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -18,6 +18,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     { href: "/evidence/upload", label: "Upload Evidence", icon: UploadCloud },
     { href: "/audit", label: "Audit Log", icon: FileText },
     { href: "/system-status", label: "System Status", icon: Activity },
+    { href: "/settings", label: "Settings", icon: Settings },
   ];
 
 

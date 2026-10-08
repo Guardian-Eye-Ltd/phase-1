@@ -88,6 +88,7 @@ class HybridSearchEngine:
                 doc_res = await db.execute(
                     select(ForensicDocument).where(
                         ForensicDocument.evidence_id == evidence_id,
+                        ForensicDocument.analysis_job_id == analysis_job_id,
                         ForensicDocument.track_id == intent["track_id"]
                     )
                 )
@@ -229,6 +230,7 @@ class HybridSearchEngine:
                 tr_res = await db.execute(
                     select(Track).where(
                         Track.evidence_id == evidence_id,
+                        Track.analysis_job_id == analysis_job_id,
                         Track.track_number == doc.track_id
                     )
                 )
@@ -239,6 +241,7 @@ class HybridSearchEngine:
                 kf_res = await db.execute(
                     select(Keyframe).where(
                         Keyframe.evidence_id == evidence_id,
+                        Keyframe.analysis_job_id == analysis_job_id,
                         Keyframe.id == doc.keyframe_id
                     )
                 )
@@ -250,6 +253,7 @@ class HybridSearchEngine:
                 det_res = await db.execute(
                     select(Detection).where(
                         Detection.evidence_id == evidence_id,
+                        Detection.analysis_job_id == analysis_job_id,
                         Detection.track_id == doc.track_id
                     )
                 )
@@ -400,28 +404,31 @@ class HybridSearchEngine:
         await db.commit()
 
         if intent.get("is_count_query"):
-            target_entity = intent.get("primary_entity") or "entity"
-            matching_tracks = []
-            for r in verified_results:
-                if r.get("track_id") is not None and r["track_id"] not in matching_tracks:
-                    matching_tracks.append(r["track_id"])
-            
-            # Query all tracks in DB for this evidence to get total distinct track count
-            all_tr_res = await db.execute(select(Track).where(Track.evidence_id == evidence_id))
-            all_tracks = all_tr_res.scalars().all()
-            if target_entity == "person":
-                entity_tracks = [t for t in all_tracks if t.class_name.lower() in ["person", "human", "pedestrian"]]
-            elif target_entity in ["car", "vehicle", "truck", "bus"]:
-                entity_tracks = [t for t in all_tracks if t.class_name.lower() in ["car", "vehicle", "truck", "bus", "automobile"]]
-            else:
-                entity_tracks = [t for t in all_tracks if target_entity.lower() in t.class_name.lower()]
-
-            count = len(entity_tracks)
+            # Delegate to the canonical deterministic count: job-scoped, distinct
+            # tracks, shared taxonomy. Imported here to avoid an import cycle
+            # (investigation_tools imports this module).
+            from app.services.agents.investigation_tools import InvestigationToolSystem
+            target_entity = (
+                (intent.get("structured_intent") or {}).get("entity")
+                or intent.get("primary_entity")
+                or "entity"
+            )
+            count_res = await InvestigationToolSystem.count_entities(
+                db=db, evidence_id=evidence_id,
+                analysis_job_id=analysis_job_id, entity=target_entity,
+            )
+            count = count_res["total"]
             if count > 0:
-                track_details = [f"Track #{t.track_number} ({t.class_name.capitalize()})" for t in entity_tracks[:5]]
-                final_answer = f"GuardianEye identified {count} distinct {target_entity} track(s) in Evidence #{evidence_id}: {', '.join(track_details)}."
+                breakdown = ", ".join(f"{n} {c}" for c, n in sorted(count_res["breakdown"].items()))
+                final_answer = (
+                    f"GuardianEye identified {count} distinct {target_entity} track(s) in "
+                    f"Evidence #{evidence_id}, analysis job #{analysis_job_id} ({breakdown})."
+                )
             else:
-                final_answer = f"GuardianEye detected 0 {target_entity} tracks in Evidence #{evidence_id}."
+                final_answer = (
+                    f"GuardianEye detected 0 {target_entity} tracks in Evidence #{evidence_id}, "
+                    f"analysis job #{analysis_job_id}."
+                )
         elif not top_results:
             final_answer = f"NO SUPPORTED EVIDENCE: GuardianEye found no sufficiently supported evidence meeting the minimum relevance threshold for: \"{query_text}\"."
         else:

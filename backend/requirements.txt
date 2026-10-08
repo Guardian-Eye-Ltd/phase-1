@@ -26,3 +26,14 @@ transformers>=4.40.0
 Pillow>=10.0.0
 chromadb>=0.5.0
 sentence-transformers>=2.7.0
+
+# ALPR / OCR.
+# easyocr only — paddleocr pins numpy<2.4 and opencv-contrib 4.x, which would
+# downgrade numpy/opencv out from under torch + ultralytics. alpr_service tries
+# PaddleOCR first and falls through to EasyOCR, so no code change is needed.
+easyocr>=1.7.0
+
+# Face recognition. buffalo_l pretrained models are licensed for non-commercial
+# research use only. First use downloads ~280 MB to ~/.insightface/models.
+insightface>=2.1
+onnxruntime>=1.20

@@ -205,7 +205,7 @@ async def get_evidence_technical_metadata(
 @router.post(
     "/{evidence_id}/reprocess",
     response_model=EvidenceResponse,
-    summary="Trigger background state reprocessing simulation"
+    summary="Run a new, isolated analysis job on existing evidence"
 )
 async def reprocess_evidence(
     evidence_id: int,
@@ -213,6 +213,10 @@ async def reprocess_evidence(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Enqueues a real analysis run. Previous runs are left untouched; the new run
+    becomes the active one only once it completes successfully.
+    """
     evidence = await EvidenceService.get_evidence_by_id(db, evidence_id)
     if not evidence:
         raise HTTPException(
@@ -220,5 +224,26 @@ async def reprocess_evidence(
             detail=f"Evidence with ID {evidence_id} not found."
         )
 
-    background_tasks.add_task(EvidenceService.process_background_pipeline, evidence.id)
+    from app.models.analysis import AnalysisJob, JobStatus, JobStage
+    from app.services.analysis_runner import run_analysis_job_async
+    job = AnalysisJob(
+        evidence_id=evidence.id,
+        status=JobStatus.QUEUED,
+        current_stage=JobStage.VALIDATING,
+        progress=0.0,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    await AuditService.log_action(
+        db=db,
+        user_id=current_user.id,
+        action="ANALYSIS_STARTED",
+        resource_type="EVIDENCE",
+        resource_id=str(evidence.id),
+        metadata={"analysis_job_id": job.id, "trigger": "reprocess"},
+    )
+    background_tasks.add_task(run_analysis_job_async, job.id)
+    await db.refresh(evidence)
     return EvidenceResponse.model_validate(evidence)

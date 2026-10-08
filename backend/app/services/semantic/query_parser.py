@@ -2,7 +2,146 @@ import re
 import logging
 from typing import Dict, Any, Optional, List
 
+from app.services.agents.taxonomy import ENTITY_CLASSES, is_known_entity
+
 logger = logging.getLogger(__name__)
+
+
+# Investigator-facing intent types for the orchestrator's router. These
+# supplement the legacy "query_type" field consumed by HybridSearchEngine.
+INTENT_COUNT = "COUNT"
+INTENT_FRAME_COUNT = "FRAME_COUNT"
+INTENT_SEARCH = "SEARCH"
+INTENT_ATTRIBUTE_SEARCH = "ATTRIBUTE_SEARCH"
+INTENT_TEMPORAL_SEARCH = "TEMPORAL_SEARCH"
+INTENT_RELATION_SEARCH = "RELATION_SEARCH"
+INTENT_EVENT_SEARCH = "EVENT_SEARCH"
+INTENT_SUMMARY = "SUMMARY"
+
+
+# Phrases that unambiguously indicate aggregation.
+_COUNT_TRIGGERS = [
+    r"\btotal number of\b",
+    r"\bnumber of\b",
+    r"\bhow many\b",
+    r"\bcount(?:\s+the)?\b",
+    r"\btotal\s+(?:count\s+of|of)?\b",
+    r"\bquantity of\b",
+]
+
+# Entity-token -> investigator-facing entity key. Built from the canonical
+# taxonomy so a single edit flows everywhere.
+_ENTITY_TOKEN_MAP: Dict[str, str] = {}
+for entity_key, class_names in ENTITY_CLASSES.items():
+    for cn in class_names:
+        _ENTITY_TOKEN_MAP[cn] = entity_key
+    _ENTITY_TOKEN_MAP[entity_key] = entity_key
+# A few natural-language aliases the raw taxonomy doesn't need to know about.
+_ENTITY_TOKEN_MAP.update({
+    "people": "person",
+    "persons": "person",
+    "humans": "person",
+    "individual": "person",
+    "cars": "car",
+    "automobile": "car",
+    "automobiles": "car",
+    "vehicles": "vehicle",
+    "traffic": "vehicle",
+    "buses": "bus",
+    "trucks": "truck",
+    "lorry": "truck",
+    "lorries": "truck",
+    "motorcycles": "motorcycle",
+    "motorbike": "motorcycle",
+    "motorbikes": "motorcycle",
+    "bike": "bicycle",
+    "bikes": "bicycle",
+    "vans": "van",
+    "backpacks": "backpack",
+    "bags": "backpack",
+})
+
+
+def _detect_entity(text_lower: str) -> Optional[str]:
+    """
+    Deterministic entity detection. Prefers the most specific concrete class
+    name over the generic bucket (e.g. "cars and buses" -> "car" primary, but
+    "vehicles" -> "vehicle").
+    """
+    hits: List[str] = []
+    for token, entity in _ENTITY_TOKEN_MAP.items():
+        if re.search(rf"\b{re.escape(token)}\b", text_lower):
+            hits.append(entity)
+    if not hits:
+        return None
+    # Priority: specific > generic. "vehicle" is the only generic bucket.
+    specific = [h for h in hits if h != "vehicle"]
+    if specific:
+        return specific[0]
+    return hits[0]
+
+
+# Words that look plate-shaped but are ordinary English / query vocabulary.
+_PLATE_STOPWORDS = {
+    "VEHICLE", "VEHICLES", "PERSON", "PEOPLE", "SEARCH", "TRACK", "TRACKS",
+    "CAMERA", "VIDEO", "EVIDENCE", "SHIRT", "BLACK", "WHITE", "GREEN", "BROWN",
+    "FIND", "SHOW", "WEARING", "CARRYING", "BETWEEN", "SECONDS", "AROUND",
+}
+
+
+def _extract_plate_candidate(text_lower: str) -> Optional[str]:
+    """
+    Pull an explicit licence-plate token out of a query.
+
+    Deliberately conservative: requires a letter+digit mix of 5-10 characters,
+    so ordinary words and bare numbers never match. Returning None is always
+    preferable to inventing a plate.
+    """
+    upper = text_lower.upper()
+
+    # Explicit cue ("plate KL01AB1234", "number plate ABC123") takes priority.
+    cued = re.search(
+        r"(?:PLATE|REGISTRATION|REGO|NUMBER\s+PLATE)\s*(?:NO\.?|NUMBER|IS|=|:)?\s*([A-Z0-9][A-Z0-9\- ]{3,11}[A-Z0-9])",
+        upper,
+    )
+    candidates = []
+    if cued:
+        candidates.append(cued.group(1))
+    else:
+        candidates.extend(re.findall(r"\b[A-Z0-9]{5,10}\b", upper))
+
+    for raw in candidates:
+        token = re.sub(r"[^A-Z0-9]", "", raw)
+        if not (5 <= len(token) <= 10):
+            continue
+        if token in _PLATE_STOPWORDS:
+            continue
+        # A plate must mix letters and digits — "SHIRT" and "123456" are not plates.
+        if not (re.search(r"[A-Z]", token) and re.search(r"\d", token)):
+            continue
+        return token
+    return None
+
+
+def _canonical_colour(colour: str) -> str:
+    """Map query words onto the stored colour vocabulary (color_naming.COLOR_NAMES)."""
+    return {"gray": "grey", "silver": "grey", "cream": "beige", "khaki": "beige"}.get(colour, colour)
+
+
+def _parse_timestamp_phrase(text_lower: str) -> Optional[float]:
+    """Pull "at 9 seconds", "at 01:20", "at 9s", "at 9.5 seconds" style."""
+    m = re.search(r"\bat\s+(\d{1,2}:\d{2})\b", text_lower)
+    if m:
+        parts = m.group(1).split(":")
+        return float(int(parts[0]) * 60 + int(parts[1]))
+    m = re.search(r"\bat\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b", text_lower)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\b(?:at\s+)?second\s+(\d+(?:\.\d+)?)\b", text_lower)
+    if m:
+        return float(m.group(1))
+    return None
+
 
 class QueryIntentParser:
     """
@@ -28,7 +167,8 @@ class QueryIntentParser:
 
     KNOWN_COLORS = [
         "red", "blue", "green", "black", "white", "yellow", "dark", "light",
-        "grey", "gray", "brown", "orange", "purple", "pink", "silver", "khaki"
+        "grey", "gray", "brown", "orange", "purple", "pink", "silver", "khaki",
+        "beige", "cream"
     ]
 
     BEHAVIORAL_KEYWORDS = [
@@ -202,11 +342,160 @@ class QueryIntentParser:
             intent["candidate_document_types"] = ["TRACK", "KEYFRAME", "BEHAVIORAL_EVENT"]
             intent["required_evidence"] = ["TRACK", "KEYFRAME"]
 
+        # ---------------------------------------------------------------
+        # Structured investigator intent (COUNT / FRAME_COUNT / ... / SUMMARY).
+        # This is the field the orchestrator routes on. Legacy "query_type"
+        # above stays for HybridSearchEngine's existing candidate filtering.
+        # ---------------------------------------------------------------
+        structured = cls._classify_structured_intent(text_lower, intent)
+        intent["structured_intent"] = structured
+
         logger.info(
-            f"[INTENT] Parsed Query: '{query_text}' -> Type: {intent['query_type']} | "
-            f"Primary Entity: {intent['primary_entity']} | Entities: {intent['entities']} | "
-            f"Colors: {intent['colors']} | Clothing: {intent['clothing']} | Behavioral: {intent['behavioral_terms']} | "
-            f"Allowed Doc Types: {intent['candidate_document_types']}"
+            f"[INTENT] Query='{query_text}' | legacy_type={intent['query_type']} | "
+            f"structured={structured['intent']} entity={structured.get('entity')} "
+            f"aggregation={structured.get('aggregation')} timestamp={structured.get('timestamp')}"
         )
 
         return intent
+
+    @classmethod
+    def _classify_structured_intent(cls, text_lower: str, legacy: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Produce the investigator-facing intent record consumed by the
+        InvestigationOrchestrator router. Deterministic — no LLM.
+        """
+        base: Dict[str, Any] = {
+            "intent": INTENT_SEARCH,
+            "entity": None,
+            "scope": "ENTIRE_VIDEO",
+            "aggregation": None,
+            "timestamp": None,
+            "start_time": legacy.get("start_time"),
+            "end_time": legacy.get("end_time"),
+            "attributes": {},
+            "event_type": None,
+            "confidence": 0.9,
+        }
+
+        entity = _detect_entity(text_lower)
+        base["entity"] = entity
+
+        has_count_trigger = any(re.search(p, text_lower) for p in _COUNT_TRIGGERS)
+        timestamp = _parse_timestamp_phrase(text_lower)
+
+        # ----- SUMMARY -----
+        if re.search(r"\b(summari[sz]e|give me a summary|overview of the video)\b", text_lower):
+            base["intent"] = INTENT_SUMMARY
+            base["confidence"] = 0.95
+            return base
+
+        # ----- EVENT_SEARCH -----
+        if legacy.get("is_behavioral_query") and not has_count_trigger:
+            base["intent"] = INTENT_EVENT_SEARCH
+            # Canonicalize to the EventEngine labels where possible.
+            terms = legacy.get("behavioral_terms") or []
+            if any("acceler" in t or "speed" in t for t in terms):
+                base["event_type"] = "SUDDEN_ACCELERATION"
+            elif any("loiter" in t or "dwell" in t for t in terms):
+                base["event_type"] = "LOITERING"
+            elif any("conceal" in t or "theft" in t or "stealing" in t for t in terms):
+                base["event_type"] = "SUSPICIOUS_CONCEALMENT"
+            elif any("altercation" in t or "fight" in t or "aggress" in t or "brawl" in t for t in terms):
+                base["event_type"] = "PHYSICAL_ALTERCATION"
+            elif any("fallen" in t or "fell" in t or "collapse" in t for t in terms):
+                base["event_type"] = "FALLEN_POSTURE"
+            elif any("proximity" in t for t in terms):
+                base["event_type"] = "PERSON_VEHICLE_PROXIMITY"
+            base["confidence"] = 0.92
+            return base
+
+        # ----- FRAME_COUNT -----
+        if has_count_trigger and timestamp is not None and entity:
+            base["intent"] = INTENT_FRAME_COUNT
+            base["scope"] = "TIMESTAMP"
+            base["timestamp"] = timestamp
+            base["aggregation"] = "DISTINCT_ACTIVE_TRACK_COUNT"
+            base["confidence"] = 0.97
+            return base
+
+        # ----- COUNT -----
+        if has_count_trigger and entity:
+            base["intent"] = INTENT_COUNT
+            base["aggregation"] = "DISTINCT_TRACK_COUNT"
+            if base["start_time"] is not None or base["end_time"] is not None:
+                base["scope"] = "TIME_WINDOW"
+            base["confidence"] = 0.98
+            return base
+
+        # ----- ATTRIBUTE_SEARCH: license plate -----
+        # Checked before colour/clothing because a plate is a far stronger
+        # identifier than any visual attribute in the same query.
+        plate = _extract_plate_candidate(text_lower)
+        if plate:
+            base["intent"] = INTENT_ATTRIBUTE_SEARCH
+            base["entity"] = entity or "vehicle"
+            base["attributes"] = {"license_plate_text": plate}
+            base["confidence"] = 0.95
+            return base
+
+        # ----- ATTRIBUTE_SEARCH: no upper garment -----
+        if re.search(r"\b(shirtless|topless|bare[- ]chest(ed)?|no shirt|without (a )?shirt)\b", text_lower):
+            base["intent"] = INTENT_ATTRIBUTE_SEARCH
+            base["entity"] = "person"
+            base["attributes"] = {"upper_garment_presence": "absent"}
+            return base
+
+        # ----- ATTRIBUTE_SEARCH -----
+        # Attribute keys are the canonical column names used by
+        # TrackAttributeAggregate, so tools can filter without translation.
+        if legacy.get("clothing") or legacy.get("objects") or (legacy.get("colors") and entity):
+            base["intent"] = INTENT_ATTRIBUTE_SEARCH
+            attrs: Dict[str, Any] = {}
+            colour = _canonical_colour(legacy["colors"][0]) if legacy["colors"] else None
+            if entity == "person":
+                if colour:
+                    # "wearing black" refers to the upper garment unless the
+                    # query names a lower garment explicitly.
+                    lower_named = any(
+                        c in text_lower
+                        for c in ("pants", "jeans", "trousers", "shorts", "skirt")
+                    )
+                    key = "lower_garment_color" if lower_named else "upper_garment_color"
+                    attrs[key] = colour
+                if legacy["clothing"]:
+                    attrs["clothing"] = legacy["clothing"]
+            elif entity in ("car", "truck", "bus", "motorcycle", "van", "vehicle", "bicycle"):
+                if colour:
+                    attrs["vehicle_color"] = colour
+            elif colour:
+                attrs["color"] = colour
+
+            if legacy.get("objects"):
+                # Carried items are detector classes; a generic "bag" only
+                # asserts that some bag is carried.
+                attrs["carries_bag"] = "true"
+                for item, words in (("suitcase", ("suitcase", "luggage")),
+                                    ("handbag", ("handbag", "purse")),
+                                    ("backpack", ("backpack", "rucksack", "knapsack"))):
+                    if any(re.search(rf"\b{w}\b", text_lower) for w in words):
+                        attrs["carried_item"] = item
+                        break
+                if not base["entity"]:
+                    base["entity"] = "person"
+            base["attributes"] = attrs
+            base["confidence"] = 0.9
+            return base
+
+        # ----- RELATION_SEARCH -----
+        if legacy.get("spatial_relation") is not None or len(legacy.get("entities", [])) >= 2:
+            base["intent"] = INTENT_RELATION_SEARCH
+            return base
+
+        # ----- TEMPORAL_SEARCH -----
+        if base["start_time"] is not None or base["end_time"] is not None:
+            base["intent"] = INTENT_TEMPORAL_SEARCH
+            return base
+
+        # ----- default SEARCH -----
+        base["intent"] = INTENT_SEARCH
+        return base

@@ -52,17 +52,8 @@ def _chroma_collection_name(evidence_id: int, analysis_job_id: int) -> str:
 
 
 async def _get_latest_completed_job_id(evidence_id: int, db: AsyncSession) -> Optional[int]:
-    """Fetch the analysis_job_id of the most recently completed job for this evidence."""
-    res = await db.execute(
-        select(AnalysisJob)
-        .where(
-            AnalysisJob.evidence_id == evidence_id,
-            AnalysisJob.status == JobStatus.COMPLETED
-        )
-        .order_by(AnalysisJob.completed_at.desc())
-    )
-    job = res.scalars().first()
-    return job.id if job else None
+    from app.services.analysis_jobs import get_active_analysis_job_id
+    return await get_active_analysis_job_id(db, evidence_id)
 
 
 class SemanticIndexer:

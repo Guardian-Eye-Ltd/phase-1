@@ -1,9 +1,10 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
     Bot, Search, ShieldCheck, CheckCircle2, AlertTriangle, XCircle,
-    Play, Clock, Download, FileText, Cpu, Sparkles, ArrowRight, Layers
+    Play, Clock, Download, FileText, Cpu, Sparkles, ArrowRight, Layers,
+    Hash
 } from "lucide-react";
 import { semanticService, AgentInvestigationResponse } from "../services/semanticService";
 
@@ -25,9 +26,20 @@ export const InvestigationWorkspace: React.FC<InvestigationWorkspaceProps> = ({
 }) => {
     const [query, setQuery] = useState("");
     const [loading, setLoading] = useState(false);
-    const [activeTab, setActiveTab] = useState<"findings" | "events" | "report">("findings");
+    const [activeTab, setActiveTab] = useState<"result" | "findings" | "events" | "report">("findings");
     const [response, setResponse] = useState<AgentInvestigationResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
+
+    const intentType = response?.intent?.type;
+    const isCountIntent = intentType === "COUNT" || intentType === "FRAME_COUNT";
+
+    useEffect(() => {
+        if (!response) return;
+        // For deterministic aggregation intents, land on the Result tab first.
+        if (isCountIntent) setActiveTab("result");
+        else if (intentType === "EVENT_SEARCH") setActiveTab("events");
+        else setActiveTab("findings");
+    }, [response, isCountIntent, intentType]);
 
     const handleRunInvestigation = async (queryToRun?: string) => {
         const targetQuery = queryToRun || query;
@@ -185,6 +197,17 @@ export const InvestigationWorkspace: React.FC<InvestigationWorkspaceProps> = ({
                     {/* Navigation Tabs */}
                     <div className="flex items-center justify-between border-b border-slate-800 pb-2">
                         <div className="flex gap-2">
+                            {isCountIntent && (
+                                <button
+                                    onClick={() => setActiveTab("result")}
+                                    className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all flex items-center gap-2 ${activeTab === "result"
+                                            ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30"
+                                            : "text-slate-400 hover:text-slate-200"
+                                        }`}
+                                >
+                                    <Hash className="w-4 h-4" /> Count Result
+                                </button>
+                            )}
                             <button
                                 onClick={() => setActiveTab("findings")}
                                 className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all flex items-center gap-2 ${activeTab === "findings"
@@ -224,16 +247,129 @@ export const InvestigationWorkspace: React.FC<InvestigationWorkspaceProps> = ({
                         )}
                     </div>
 
+                    {/* TAB 0: Deterministic Count Result (COUNT / FRAME_COUNT) */}
+                    {activeTab === "result" && isCountIntent && (
+                        <div className="space-y-4">
+                            {(() => {
+                                const r = response.result || {};
+                                const intent = response.intent!;
+                                const total = (r.total ?? r.count ?? 0) as number;
+                                const breakdown = r.breakdown || {};
+                                const breakdownEntries = Object.entries(breakdown).sort(
+                                    (a, b) => (b[1] as number) - (a[1] as number)
+                                );
+                                const headerLabel = intent.type === "FRAME_COUNT"
+                                    ? `Active ${intent.entity ?? "entities"} at t=${(intent.timestamp ?? 0).toFixed(2)}s`
+                                    : `Unique ${intent.entity ?? "entities"} detected`;
+                                const verOk = response.verification?.status === "SUPPORTED";
+
+                                return (
+                                    <>
+                                        {/* Headline card */}
+                                        <div className="bg-gradient-to-br from-cyan-950/50 via-slate-900 to-slate-900 border border-cyan-500/30 rounded-2xl p-8 shadow-2xl">
+                                            <div className="flex items-center justify-between gap-4 flex-wrap">
+                                                <div>
+                                                    <p className="text-xs uppercase tracking-widest text-cyan-400 font-semibold mb-2">
+                                                        {headerLabel}
+                                                    </p>
+                                                    <div className="flex items-baseline gap-3">
+                                                        <span className="text-6xl font-black text-white tabular-nums">
+                                                            {total}
+                                                        </span>
+                                                        <span className="text-slate-400 text-lg capitalize">
+                                                            {intent.entity}{total === 1 ? "" : "s"}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-xs text-slate-500 mt-3 font-mono">
+                                                        aggregation: {intent.aggregation} · scope: {intent.scope ?? "ENTIRE_VIDEO"}
+                                                        {response.analysis_job_id != null && ` · job #${response.analysis_job_id}`}
+                                                    </p>
+                                                </div>
+                                                <div>
+                                                    {verOk ? (
+                                                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                                                            <CheckCircle2 className="w-4 h-4" /> VERIFIED (DETERMINISTIC)
+                                                        </span>
+                                                    ) : (
+                                                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                                                            <AlertTriangle className="w-4 h-4" /> {response.verification?.status ?? "UNVERIFIED"}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Breakdown table */}
+                                        {breakdownEntries.length > 0 && (
+                                            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+                                                <h4 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2">
+                                                    <Layers className="w-4 h-4 text-cyan-400" /> Breakdown by Class
+                                                </h4>
+                                                <div className="divide-y divide-slate-800">
+                                                    {breakdownEntries.map(([cls, n]) => (
+                                                        <div key={cls} className="flex items-center justify-between py-2 text-sm">
+                                                            <span className="text-slate-300 capitalize">{cls}</span>
+                                                            <span className="text-white font-mono font-bold tabular-nums">{n as number}</span>
+                                                        </div>
+                                                    ))}
+                                                    <div className="flex items-center justify-between py-2 pt-3 text-sm">
+                                                        <span className="text-cyan-400 font-semibold uppercase text-xs tracking-wider">Total</span>
+                                                        <span className="text-cyan-400 font-mono font-bold tabular-nums text-base">{total}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Track IDs */}
+                                        {r.track_ids && r.track_ids.length > 0 && (
+                                            <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
+                                                <p className="text-xs text-slate-400 mb-2 font-semibold uppercase tracking-wider">
+                                                    Counted Track IDs ({r.track_ids.length})
+                                                </p>
+                                                <div className="flex flex-wrap gap-1.5">
+                                                    {r.track_ids.map((tid) => (
+                                                        <span key={tid} className="text-xs font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                                                            #{tid}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Methodology note */}
+                                        <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 text-xs text-slate-500 leading-relaxed">
+                                            Each tracked entity is counted exactly once regardless of how many frames it appears in.
+                                            Per-frame visual counts (VLM) are <span className="text-slate-300 font-semibold">not summed</span>.
+                                            Event-engine findings (loitering, acceleration, etc.) are intentionally omitted from count queries.
+                                        </div>
+                                    </>
+                                );
+                            })()}
+                        </div>
+                    )}
+
                     {/* TAB 1: Verified Findings */}
                     {activeTab === "findings" && (
                         <div className="space-y-4">
                             {response.findings.length === 0 ? (
                                 <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-8 text-center text-slate-400">
                                     <AlertTriangle className="w-8 h-8 text-amber-400 mx-auto mb-2" />
-                                    <p className="font-semibold text-slate-300">NO SUPPORTED EVIDENCE FOUND</p>
-                                    <p className="text-xs text-slate-500 mt-1">
-                                        The requested entities or attributes did not meet the minimum verification threshold in this video.
-                                    </p>
+                                    {isCountIntent ? (
+                                        <>
+                                            <p className="font-semibold text-slate-300">COUNT INTENT — see the Count Result tab</p>
+                                            <p className="text-xs text-slate-500 mt-1">
+                                                Deterministic aggregation queries don&apos;t produce verified-finding cards.
+                                                The authoritative total is shown under <span className="text-cyan-400">Count Result</span>.
+                                            </p>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <p className="font-semibold text-slate-300">NO SUPPORTED EVIDENCE FOUND</p>
+                                            <p className="text-xs text-slate-500 mt-1">
+                                                The requested entities or attributes did not meet the minimum verification threshold in this video.
+                                            </p>
+                                        </>
+                                    )}
                                 </div>
                             ) : (
                                 response.findings.map((item, idx) => (
