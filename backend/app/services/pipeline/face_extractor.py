@@ -16,7 +16,7 @@ import numpy as np
 from app.core.config import settings
 from app.models.face import FaceQuality
 from app.services.face.crypto import encrypt_embedding
-from app.services.face.engine import EMBEDDING_MODEL_ID, DetectedFace, FaceEngine, assess_quality
+from app.services.face.engine import EMBEDDING_DIM, EMBEDDING_MODEL_ID, DetectedFace, FaceEngine, assess_quality
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,8 @@ def extract_faces(
             face_crop = frame[fy1:fy2, fx1:fx2]
 
             quality = assess_quality(face_crop, width_px, height_px, face.det_score)
+            # Low-quality faces are never compared, so they are never embedded.
+            vector = face.vector() if quality.status == FaceQuality.USABLE else None
 
             crop_name = f"face_ev{evidence_id}_job{analysis_job_id}_trk{track_number}_fn{det['frame_number']}.jpg"
             crop_path = os.path.join(out_dir, crop_name)
@@ -121,12 +123,9 @@ def extract_faces(
                 "sharpness": quality.sharpness,
                 "quality_status": quality.status,
                 "quality_reasons": quality.reasons,
-                # Low-quality faces are never compared, so their embeddings are not kept.
-                "embedding_encrypted": (
-                    encrypt_embedding(face.embedding) if quality.status == FaceQuality.USABLE else None
-                ),
+                "embedding_encrypted": encrypt_embedding(vector) if vector is not None else None,
                 "embedding_model": EMBEDDING_MODEL_ID,
-                "embedding_dim": int(face.embedding.shape[0]),
+                "embedding_dim": int(vector.shape[0]) if vector is not None else EMBEDDING_DIM,
                 "crop_filename": crop_name,
                 "crop_sha256": crop_sha,
             })

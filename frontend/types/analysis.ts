@@ -23,6 +23,8 @@ export interface AnalysisJob {
     error_message?: string;
     model_name?: string;
     manifest_hash?: string;
+    /** Seconds per pipeline stage; null for runs made before timing was recorded. */
+    stage_timings?: Record<string, number> | null;
 }
 
 export interface Detection {

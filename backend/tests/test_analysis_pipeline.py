@@ -53,10 +53,12 @@ def test_object_detector_and_tracker(sample_video_path):
     detector = ObjectDetector(confidence_threshold=0.3)
     tracker = MultiObjectTracker(iou_threshold=0.2)
 
+    dets = detector.detect_batch(frames)
+    assert detector.last_diagnostics["processed_frames"] == len(frames)
+
     all_dets = []
     for fn, ts, frame in frames:
-        dets = detector.detect_frame(frame, fn, ts)
-        tracked = tracker.process_frame_detections(dets)
+        tracked = tracker.process_frame_detections([d for d in dets if d["frame_number"] == fn])
         all_dets.extend(tracked)
 
     summaries = MultiObjectTracker.generate_track_summaries(all_dets)

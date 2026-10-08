@@ -73,7 +73,7 @@ def embed_query_photo(
             f"The photo contains {len(usable)} clear faces. Crop it to the one person you are looking for."
         )
     face, _ = usable[0]
-    return {"embedding": face.embedding, "photo_sha256": hashlib.sha256(image_bytes).hexdigest()}
+    return {"embedding": face.vector(), "photo_sha256": hashlib.sha256(image_bytes).hexdigest()}
 
 
 async def search_faces(

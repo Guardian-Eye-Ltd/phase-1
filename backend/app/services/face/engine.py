@@ -8,7 +8,7 @@ infer sensitive personal characteristics.
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -19,13 +19,26 @@ from app.models.face import FaceQuality
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL_ID = f"insightface/{settings.FACE_MODEL_PACK}:arcface"
+EMBEDDING_DIM = 512   # ArcFace output size; recorded even for faces that are never embedded
 
 
 @dataclass
 class DetectedFace:
     bbox: Tuple[float, float, float, float]   # pixel coords in the image passed to detect()
     det_score: float
-    embedding: np.ndarray                      # L2-normalised
+    embedding: Optional[np.ndarray] = None     # L2-normalised; see vector()
+    embed: Optional[Callable[[], np.ndarray]] = field(default=None, repr=False, compare=False)
+
+    def vector(self) -> np.ndarray:
+        """
+        The L2-normalised embedding, computed on first use. Recognition costs
+        ~0.26 s per face on CPU and a head crop often contains a neighbour's
+        face too; callers pick a face by box and score first, so only the face
+        actually kept pays for recognition.
+        """
+        if self.embedding is None:
+            self.embedding = self.embed()
+        return self.embedding
 
 
 @dataclass
@@ -99,12 +112,23 @@ class FaceEngine:
     def detect(cls, image_bgr: np.ndarray) -> List[DetectedFace]:
         if not cls.load():
             raise RuntimeError(f"Face model unavailable: {cls._load_error}")
-        faces = cls._app.get(image_bgr)
-        return [
-            DetectedFace(
-                bbox=tuple(float(v) for v in f.bbox),
-                det_score=float(f.det_score),
-                embedding=np.asarray(f.normed_embedding, dtype=np.float32),
-            )
-            for f in faces
-        ]
+        # Same steps as FaceAnalysis.get(), with recognition deferred to
+        # DetectedFace.vector() (no add-ons are loaded, so nothing else runs).
+        from insightface.app.common import Face
+        bboxes, kpss = cls._app.det_model.detect(image_bgr, max_num=0, metric="default")
+        recognizer = cls._app.models["recognition"]
+
+        def _embed(face):
+            recognizer.get(image_bgr, face)
+            return np.asarray(face.normed_embedding, dtype=np.float32)
+
+        out = []
+        for i in range(bboxes.shape[0]):
+            face = Face(bbox=bboxes[i, 0:4], kps=kpss[i] if kpss is not None else None,
+                        det_score=bboxes[i, 4])
+            out.append(DetectedFace(
+                bbox=tuple(float(v) for v in face.bbox),
+                det_score=float(face.det_score),
+                embed=lambda face=face: _embed(face),
+            ))
+        return out

@@ -243,6 +243,7 @@ export default function EvidenceDetailsPage() {
                         currentStage={job.current_stage}
                         progress={job.progress}
                         errorMessage={job.error_message}
+                        stageTimings={job.stage_timings}
                         onCancel={handleCancelJob}
                     />
                 )}

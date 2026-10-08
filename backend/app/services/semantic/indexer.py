@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import threading
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -21,17 +22,20 @@ _indexing_status: Dict[int, Dict[str, Any]] = {}
 
 # Lazy-loaded embedding model & Chroma client cache
 _EMBEDDING_MODEL = None
+_EMBEDDING_MODEL_LOCK = threading.Lock()
 _CHROMA_CLIENT = None
 
 
 def get_embedding_model():
+    """Blocking on first call (model load); async callers use asyncio.to_thread."""
     global _EMBEDDING_MODEL
-    if _EMBEDDING_MODEL is None:
-        logger.info(
-            f"[EMBEDDING] Loading sentence-transformer '{settings.EMBEDDING_MODEL_NAME}' "
-            f"on device '{settings.DEVICE}'..."
-        )
-        _EMBEDDING_MODEL = SentenceTransformer(settings.EMBEDDING_MODEL_NAME, device=settings.DEVICE)
+    with _EMBEDDING_MODEL_LOCK:
+        if _EMBEDDING_MODEL is None:
+            logger.info(
+                f"[EMBEDDING] Loading sentence-transformer '{settings.EMBEDDING_MODEL_NAME}' "
+                f"on device '{settings.DEVICE}'..."
+            )
+            _EMBEDDING_MODEL = SentenceTransformer(settings.EMBEDDING_MODEL_NAME, device=settings.DEVICE)
     return _EMBEDDING_MODEL
 
 
@@ -170,7 +174,7 @@ class SemanticIndexer:
                 )
 
                 # 3. Generate Vector Embeddings (off the event-loop thread)
-                model = get_embedding_model()
+                model = await asyncio.to_thread(get_embedding_model)
                 doc_contents = [d.content for d in saved_docs]
 
                 loop = asyncio.get_event_loop()

@@ -116,7 +116,8 @@ async def get_analysis_job_status(
         "completed_at": job.completed_at,
         "error_message": job.error_message,
         "model_name": job.model_name,
-        "manifest_hash": job.manifest_hash
+        "manifest_hash": job.manifest_hash,
+        "stage_timings": job.stage_timings,
     }
 
 @router.post("/analysis/{job_id}/cancel")
@@ -232,7 +233,7 @@ async def get_entities(
     determined, the reason — so "unknown" is always explained.
     """
     from app.models.observation import TrackAttributeAggregate
-    from app.services.pipeline.alpr_service import MIN_VEHICLE_WIDTH_FOR_OCR_PX
+    from app.services.pipeline.alpr_service import plate_unread_reason
     from app.services.pipeline.capability_registry import get_capability
 
     job = await _get_latest_completed_job(evidence_id, db, job_id)
@@ -298,13 +299,8 @@ async def get_entities(
                 width_px = int(max_width.get(t.track_number, 0) * frame_w) if frame_w else None
                 if plate_cap["state"] == "NOT_AVAILABLE":
                     not_determined["license_plate_text"] = plate_cap["reason"]
-                elif width_px is not None and width_px < MIN_VEHICLE_WIDTH_FOR_OCR_PX:
-                    not_determined["license_plate_text"] = (
-                        f"vehicle too small to read a plate (largest view {width_px}px wide; "
-                        f"needs at least {MIN_VEHICLE_WIDTH_FOR_OCR_PX}px)"
-                    )
                 else:
-                    not_determined["license_plate_text"] = "no readable plate text in the vehicle's clearest frames"
+                    not_determined["license_plate_text"] = plate_unread_reason(width_px)
             not_determined["vehicle_make_model"] = make_cap["reason"]
         else:
             kind, fields = "OBJECT", []
@@ -352,6 +348,7 @@ async def list_analysis_jobs(
             "confidence_threshold": j.confidence_threshold,
             "model_name": j.model_name,
             "error_message": j.error_message,
+            "stage_timings": j.stage_timings,
         }
         for j in jobs
     ]

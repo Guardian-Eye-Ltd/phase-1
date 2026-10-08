@@ -10,10 +10,21 @@ Two fixes over the original per-call implementation:
 
 The result is mathematically identical to a full CLIP forward pass: softmax of
 logit_scale * cosine(image, text).
+
+Batching: CLIP is ~90% of the detection stage, and one crop at a time is the
+slowest way to run it on CPU. The detector therefore enriches each batch of
+frames twice: once inside recording() on throw-away copies, which notes every
+crop classify() is asked about without running CLIP; then inside serving(),
+with all those crops encoded in one batched forward pass by encode_batch().
+The attribute logic itself is unchanged, and batched features equal per-crop
+features to ~1e-7.
 """
+import hashlib
 import logging
+import threading
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -53,15 +64,81 @@ def _text_features(prompts: Tuple[str, ...]) -> Optional[torch.Tensor]:
     return feats / feats.norm(dim=-1, keepdim=True)
 
 
-def _image_features(crop_bgr: np.ndarray) -> Optional[torch.Tensor]:
+_state = threading.local()   # .recording: list of crops | None, .features: dict | None
+
+ENCODE_BATCH_SIZE = 32
+
+
+def _key(crop_bgr: np.ndarray) -> bytes:
+    """Exact content key for a crop (shape + pixels)."""
+    h = hashlib.blake2b(np.ascontiguousarray(crop_bgr).tobytes(), digest_size=16)
+    h.update(repr(crop_bgr.shape).encode())
+    return h.digest()
+
+
+def _encode(crops_bgr: Sequence[np.ndarray]) -> Optional[torch.Tensor]:
     clip_model, clip_proc = _model()
-    if clip_model is None or crop_bgr is None or crop_bgr.size == 0:
+    if clip_model is None:
         return None
-    img = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-    inputs = clip_proc(images=img, return_tensors="pt").to(settings.DEVICE)
+    imgs = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in crops_bgr]
+    inputs = clip_proc(images=imgs, return_tensors="pt").to(settings.DEVICE)
     with torch.no_grad():
         feats = _as_tensor(clip_model.get_image_features(**inputs))
     return feats / feats.norm(dim=-1, keepdim=True)
+
+
+def _image_features(crop_bgr: np.ndarray) -> Optional[torch.Tensor]:
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    served = getattr(_state, "features", None)
+    if served is not None:
+        hit = served.get(_key(crop_bgr))
+        if hit is not None:
+            return hit
+    return _encode([crop_bgr])
+
+
+@contextmanager
+def recording() -> Iterator[List[np.ndarray]]:
+    """classify() records each crop it is asked about and returns {} without running CLIP."""
+    crops: List[np.ndarray] = []
+    _state.recording = crops
+    try:
+        yield crops
+    finally:
+        _state.recording = None
+
+
+@contextmanager
+def serving(features: Dict[bytes, torch.Tensor]) -> Iterator[None]:
+    """classify() takes image features from encode_batch() output (per-crop fallback on a miss)."""
+    _state.features = features
+    try:
+        yield
+    finally:
+        _state.features = None
+
+
+def encode_batch(crops_bgr: Sequence[np.ndarray]) -> Dict[bytes, torch.Tensor]:
+    """Encode distinct crops in batches of ENCODE_BATCH_SIZE; {} when CLIP is unavailable."""
+    unique: Dict[bytes, np.ndarray] = {}
+    for c in crops_bgr:
+        if c is not None and c.size:
+            unique.setdefault(_key(c), c)
+    keys = list(unique)
+    out: Dict[bytes, torch.Tensor] = {}
+    try:
+        for i in range(0, len(keys), ENCODE_BATCH_SIZE):
+            chunk = keys[i:i + ENCODE_BATCH_SIZE]
+            feats = _encode([unique[k] for k in chunk])
+            if feats is None:
+                return {}
+            for j, k in enumerate(chunk):
+                out[k] = feats[j:j + 1]
+    except Exception as e:
+        logger.warning(f"[CLIP] Batched encode failed, falling back to per-crop: {e}")
+        return {}
+    return out
 
 
 def classify(
@@ -72,6 +149,11 @@ def classify(
     using a single image encode. Empty dict when CLIP is unavailable.
     """
     if not settings.ENABLE_ATTRIBUTE_CLASSIFICATION:
+        return {}
+    recorder = getattr(_state, "recording", None)
+    if recorder is not None:
+        if crop_bgr is not None and crop_bgr.size:
+            recorder.append(crop_bgr)
         return {}
     try:
         image = _image_features(crop_bgr)

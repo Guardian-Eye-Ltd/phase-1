@@ -49,6 +49,7 @@ async def auto_migrate_schema(db_engine: AsyncEngine = engine):
         ("semantic_documents", "INTEGER DEFAULT 0 NOT NULL"),
         ("face_stage", "VARCHAR(20) DEFAULT 'NOT_RUN' NOT NULL"),
         ("face_stage_detail", "TEXT"),
+        ("stage_timings", "JSON"),
     ]
     # One transaction per statement: on Postgres a failed ALTER ("column exists")
     # aborts the whole transaction, which would silently skip every later column.

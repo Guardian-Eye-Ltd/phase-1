@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 # Indian formats: KL01AB1234 style and Bharat series 22BH1234AB.
 INDIAN_PLATE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{1,4}$|^\d{2}BH\d{4}[A-Z]{1,2}$")
+# State / union-territory prefixes (incl. legacy OR, UA and the 2024 TG).
+# Used only to label a consensus read as a complete number, never to filter
+# or rewrite OCR output: "JA3K961" is a consistent read with an impossible prefix.
+INDIAN_STATE_CODES = {
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA", "GJ", "HP", "HR",
+    "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML", "MN", "MP", "MZ", "NL", "OD", "OR",
+    "PB", "PY", "RJ", "SK", "TG", "TN", "TR", "TS", "UA", "UK", "UP", "WB",
+}
 MIN_VEHICLE_WIDTH_FOR_OCR_PX = 120
 MAX_FRAMES_PER_TRACK = 4
 MIN_SECONDS_BETWEEN_SAMPLES = 0.5
@@ -109,6 +117,15 @@ def correct_to_indian_format(text: str, max_substitutions: int = 3) -> Optional[
     return None
 
 
+def plate_format_issue(text: str) -> Optional[str]:
+    """None when text is a complete Indian plate number, else why it is not."""
+    if not INDIAN_PLATE.match(text):
+        return "does not match the Indian plate pattern (characters may be missing)"
+    if not text[:2].isdigit() and text[:2] not in INDIAN_STATE_CODES:
+        return f"'{text[:2]}' is not an Indian state code, so at least one letter is likely misread"
+    return None
+
+
 def validation_score(text: str) -> float:
     if not (4 <= len(text) <= 10) or not re.search(r"\d", text):
         return 0.0
@@ -181,14 +198,21 @@ def vote_plate(reads: List[Tuple[str, float]], min_reads: int = 2,
     best_len = max(lengths, key=lambda L: (lengths[L], sum(c for t, c in reads if len(t) == L)))
     same = [(t, c) for t, c in reads if len(t) == best_len]
 
-    consensus, fractions = [], []
+    consensus, fractions, disputed = [], [], []
     for i in range(best_len):
         weights: Dict[str, float] = defaultdict(float)
+        votes: Dict[str, int] = defaultdict(int)
         for t, c in same:
             weights[t[i]] += max(c, 1e-3)
+            votes[t[i]] += 1
         ch, wt = max(weights.items(), key=lambda kv: kv[1])
         consensus.append(ch)
         fractions.append(wt / sum(weights.values()))
+        # Confidence weighting alone let one confident read outvote one less
+        # confident read ("CA82545" from EA82545 vs CA82545): every asserted
+        # character must be read the same way at least min_reads times.
+        if votes[ch] < min_reads:
+            disputed.append(f"character {i + 1}: " + " vs ".join(sorted(votes)))
     value = "".join(consensus)
     agreement = float(np.mean(fractions))
     mean_conf = float(np.mean([c for _, c in same]))
@@ -197,16 +221,30 @@ def vote_plate(reads: List[Tuple[str, float]], min_reads: int = 2,
 
     if len(same) < min_reads:
         status, reason = "WITHHELD", f"only {len(same)} read(s) of this length"
+    elif disputed:
+        status, reason = "WITHHELD", "reads disagree on " + "; ".join(disputed)
     elif min(fractions) < min_position_majority:
         status, reason = "WITHHELD", "reads disagree on at least one character"
     else:
         status, reason = "OBSERVED", ""
     return {
         "value": value, "status": status, "reason": reason,
+        # A consistent read can still be partial (OCR dropped characters);
+        # only a full match of the plate format is a complete number.
+        "format_complete": plate_format_issue(value) is None,
+        "format_issue": plate_format_issue(value),
         "confidence": round(confidence, 4), "agreement": round(agreement, 4),
         "reads_considered": len(same), "reads_total": len(reads), "exact_matches": exact,
         "min_position_majority": round(min(fractions), 4),
     }
+
+
+def plate_unread_reason(width_px: Optional[int]) -> str:
+    """Why a vehicle track has no plate read at all (shared by /entities and search)."""
+    if width_px is not None and width_px < MIN_VEHICLE_WIDTH_FOR_OCR_PX:
+        return (f"vehicle too small to read a plate (largest view {width_px}px wide; "
+                f"needs at least {MIN_VEHICLE_WIDTH_FOR_OCR_PX}px)")
+    return "no readable plate text in the vehicle's clearest frames"
 
 
 def _best_frames(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

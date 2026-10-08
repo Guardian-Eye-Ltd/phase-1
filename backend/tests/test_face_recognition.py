@@ -138,6 +138,44 @@ def test_extraction_encrypts_usable_faces_only(tmp_path):
     assert "_job3_" in by_track[1]["crop_filename"]
 
 
+def test_only_the_kept_usable_face_is_embedded(tmp_path):
+    """Recognition is the expensive step; neighbours in the head crop and low-quality faces skip it."""
+    frame = textured(400, 400)
+    sampled = [(10, 1.0, frame), (20, 2.0, frame)]
+    dets = [
+        {**_pdet(10, 1.0, 0.4, track=1), "bbox_x1": 0.1, "bbox_x2": 0.5, "bbox_y1": 0.1, "bbox_y2": 0.9},
+        {**_pdet(20, 2.0, 0.4, track=2), "bbox_x1": 0.1, "bbox_x2": 0.5, "bbox_y1": 0.1, "bbox_y2": 0.9},
+    ]
+    sizes = {1: 80, 2: 12}   # track 2's face is too small to compare
+    embedded = []
+
+    def fake_detect(region):
+        track = 1 if not hasattr(fake_detect, "seen") else 2
+        fake_detect.seen = True
+        s, cx = sizes[track], region.shape[1] / 2
+
+        def face(label, x):
+            return DetectedFace(bbox=(x - s / 2, 10, x + s / 2, 10 + s), det_score=0.9,
+                                embed=lambda: embedded.append(label) or unit((track, 1.0)))
+        # The person's own face at the centre, a neighbour's at the edge.
+        return [face(f"neighbour{track}", s / 2), face(f"centre{track}", cx)]
+
+    obs = extract_faces(sampled, dets, evidence_id=7, analysis_job_id=3,
+                        derived_dir=str(tmp_path), detect_fn=fake_detect)
+    by_track = {o["track_number"]: o for o in obs}
+    assert embedded == ["centre1"]
+    assert np.allclose(decrypt_embedding(by_track[1]["embedding_encrypted"]), unit((1, 1.0)))
+    assert by_track[2]["quality_status"] == FaceQuality.LOW_QUALITY
+    assert by_track[2]["embedding_encrypted"] is None and by_track[2]["embedding_dim"] == 512
+
+
+def test_detected_face_embeds_once():
+    calls = []
+    f = DetectedFace((0, 0, 10, 10), 0.9, embed=lambda: calls.append(1) or unit((0, 1.0)))
+    assert np.allclose(f.vector(), unit((0, 1.0))) and np.allclose(f.vector(), unit((0, 1.0)))
+    assert calls == [1]
+
+
 # ======================================================================
 # Query photo handling
 # ======================================================================

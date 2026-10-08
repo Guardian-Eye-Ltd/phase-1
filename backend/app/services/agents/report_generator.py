@@ -330,6 +330,66 @@ below threshold are marked `WITHHELD` and excluded from matches.
 """
 
     @classmethod
+    def generate_plate_report(
+        cls,
+        investigation_id: str,
+        video_filename: str,
+        query_text: str,
+        answer: str,
+        vehicles: List[Dict[str, Any]],
+        analysis_job_id: Optional[int] = None,
+        evidence_hash: Optional[str] = None,
+    ) -> str:
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        rows = ""
+        for v in vehicles:
+            p = v["plate"]
+            reads = p.get("reads_total")
+            rows += (
+                f"| #{v['track_id']} | {v['class_name']} | {v.get('vehicle_color') or '—'} | "
+                f"{p['text'] or '—'} | `{p['status']}` | {reads if reads is not None else '—'} | "
+                f"{p.get('reason') or ((p.get('format_issue') or 'incomplete plate format') if p['status'] == 'READ' and not p.get('format_complete') else '')} |\n"
+            )
+        table = (
+            "| Track | Class | Colour | Plate | Status | OCR reads | Note |\n"
+            "|---|---|---|---|---|---:|---|\n" + rows
+        ) if vehicles else "_No vehicle tracks in scope._\n"
+
+        return f"""# GUARDIANEYE — Licence Plate Report
+
+- **Investigation ID**: `{investigation_id}`
+- **Date / Time**: `{now_str}`
+- **Evidence Video**: `{video_filename}`
+- **SHA-256 Hash**: `{evidence_hash or "N/A"}`
+- **Investigator Query**: *"{query_text}"*
+- **Analysis Job**: #{analysis_job_id}
+
+---
+
+## Result
+
+{answer}
+
+{table}
+---
+
+## Methodology
+
+Plates are read per vehicle track with EasyOCR on up to four of the vehicle's
+largest frames, then voted **character by character**. A plate is `READ` only
+when every character was read the same way by at least two OCR reads.
+`UNCONFIRMED` means text was read but the reads disagree or were too few; the
+best guess is shown so it can be checked, and it is **never** an identification.
+`NOT_READ` gives the reason no plate text exists (usually vehicle size).
+
+## Limitations
+
+> Plate OCR is a `DEGRADED` capability. Small, angled, blurred or night-time
+> plates are frequently misread. Check every plate against the footage before
+> drawing any investigative conclusion.
+"""
+
+    @classmethod
     def generate_frame_count_report(
         cls,
         investigation_id: str,

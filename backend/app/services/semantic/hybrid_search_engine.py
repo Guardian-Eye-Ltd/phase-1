@@ -12,6 +12,7 @@ from app.models.semantic import (
     ForensicDocument, SearchQuery, SearchResult, ConfidenceLevel, DocumentSourceType, DocumentType, VLMObservation
 )
 from app.services.semantic.query_parser import QueryIntentParser
+from app.services.semantic.structured_answers import structured_search
 from app.services.semantic.indexer import (
     get_embedding_model, get_chroma_client,
     _chroma_collection_name, _get_latest_completed_job_id
@@ -25,6 +26,24 @@ class HybridSearchEngine:
     candidate document type filtering, required entity verification, hybrid ranking,
     strict relevance thresholds, and transparent confidence metrics.
     """
+
+    @staticmethod
+    def _save_results(db: AsyncSession, db_query: SearchQuery, evidence_id: int, items: List[Dict[str, Any]]) -> None:
+        for item in items:
+            db.add(SearchResult(
+                search_query_id=db_query.id,
+                evidence_id=evidence_id,
+                track_id=item["track_id"],
+                keyframe_id=item["keyframe_id"],
+                start_time=item["start_time"],
+                end_time=item["end_time"],
+                relevance_score=item["score"],
+                confidence_level=ConfidenceLevel(item["confidence_level"]),
+                confidence_reason=item["confidence_reason"],
+                summary_text=item["summary"],
+                explanation_json=item["why_explanation"],
+                verification_status=item["verification_status"]
+            ))
 
     @classmethod
     async def execute_search(
@@ -74,6 +93,33 @@ class HybridSearchEngine:
         await db.commit()
         await db.refresh(db_query)
 
+        # Step 2b: Plate and attribute questions are answered from the per-track
+        # attribute consensus; vector similarity cannot find "the vehicle number".
+        structured_note = None
+        structured = await structured_search(
+            db, evidence_id, analysis_job_id, intent.get("structured_intent") or {}
+        )
+        if structured is not None and (structured["results"] or structured["definitive"]):
+            execution_time = (time.time() - start_time_perf) * 1000.0
+            db_query.execution_time_ms = execution_time
+            cls._save_results(db, db_query, evidence_id, structured["results"])
+            await db.commit()
+            return {
+                "search_query_id": db_query.id,
+                "evidence_id": evidence_id,
+                "query": query_text,
+                "extracted_intent": intent,
+                "answer": structured["answer"],
+                "execution_time_ms": round(execution_time, 2),
+                "total_results": len(structured["results"]),
+                "suggestions": [],
+                "results": structured["results"],
+            }
+        if structured is not None:
+            # Nothing matched structurally; semantic matches below are scene
+            # descriptions, not verified attributes, and the answer says so.
+            structured_note = structured["answer"]
+
         # Step 3: Query Routing — Track Search Direct DB Lookup (scoped to job)
         if intent["query_type"] == "TRACK_SEARCH" and intent["track_id"] is not None:
             t_res = await db.execute(
@@ -94,7 +140,9 @@ class HybridSearchEngine:
                 )
                 track_docs = doc_res.scalars().all()
                 if track_docs:
-                    doc = track_docs[0]
+                    # The track's own narrative (with its attribute consensus),
+                    # not a keyframe caption that happens to mention the track.
+                    doc = next((d for d in track_docs if d.document_type == DocumentType.TRACK), track_docs[0])
                     why_exp = {
                         "semantic_match_score": 1.0,
                         "semantic_match_percentage": "100%",
@@ -147,7 +195,7 @@ class HybridSearchEngine:
                     }
 
         # Step 4: Vector & Structured Retrieval (job-scoped collection)
-        model = get_embedding_model()
+        model = await asyncio.to_thread(get_embedding_model)
         chroma_client = get_chroma_client()
         collection_name = _chroma_collection_name(evidence_id, analysis_job_id)
 
@@ -217,6 +265,11 @@ class HybridSearchEngine:
         for doc_id, sim in distances_map.items():
             doc = doc_lookup.get(doc_id)
             if not doc:
+                continue
+
+            # After a structured attribute miss, track documents can only repeat
+            # the consensus that just said "no"; only scene descriptions remain.
+            if structured_note and doc.document_type == DocumentType.TRACK:
                 continue
 
             # Candidate document type filter
@@ -325,6 +378,8 @@ class HybridSearchEngine:
                     })
 
             attribute_score = (matched_attr_count / len(all_target_attrs)) if all_target_attrs else 1.0
+            if structured_note and attribute_score < 1.0:
+                continue   # a scene description must at least mention every requested attribute
             entity_score = 1.0 if entity_matched else (0.80 if doc.document_type.value == "BEHAVIORAL_EVENT" else 0.0)
 
             # Keyword overlap boost (+0.05 per matched entity or color or behavior word)
@@ -376,6 +431,12 @@ class HybridSearchEngine:
                 "why_explanation": why_explanation,
                 "verification_status": "VERIFIED"
             }
+            if structured_note:
+                result_item["verification_status"] = "UNVERIFIED"
+                result_item["confidence_reason"] = (
+                    "A scene description mentions the requested attribute; it is not a verified "
+                    "attribute of any tracked object."
+                )
             verified_results.append(result_item)
 
         verified_results.sort(key=lambda x: x["score"], reverse=True)
@@ -384,23 +445,7 @@ class HybridSearchEngine:
         execution_time = (time.time() - start_time_perf) * 1000.0
         db_query.execution_time_ms = execution_time
 
-        # Save search results to DB
-        for item in top_results:
-            db_res = SearchResult(
-                search_query_id=db_query.id,
-                evidence_id=evidence_id,
-                track_id=item["track_id"],
-                keyframe_id=item["keyframe_id"],
-                start_time=item["start_time"],
-                end_time=item["end_time"],
-                relevance_score=item["score"],
-                confidence_level=ConfidenceLevel(item["confidence_level"]),
-                confidence_reason=item["confidence_reason"],
-                summary_text=item["summary"],
-                explanation_json=item["why_explanation"],
-                verification_status=item["verification_status"]
-            )
-            db.add(db_res)
+        cls._save_results(db, db_query, evidence_id, top_results)
         await db.commit()
 
         if intent.get("is_count_query"):
@@ -434,6 +479,13 @@ class HybridSearchEngine:
         else:
             best_res = top_results[0]
             final_answer = f"Evidence grounded match found for evidence #{evidence_id}: {best_res['summary']} (Track #{best_res['track_id'] or 'N/A'}, Query Relevance: {best_res['query_relevance']:.0f}%)."
+
+        if structured_note:
+            final_answer = (
+                f"{structured_note} "
+                + ("Closest semantic matches below are scene descriptions, not verified attributes."
+                   if top_results else "No semantic matches either.")
+            )
 
         return {
             "search_query_id": db_query.id,

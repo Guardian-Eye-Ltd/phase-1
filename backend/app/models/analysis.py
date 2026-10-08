@@ -85,6 +85,10 @@ class AnalysisJob(Base):
     # Lets a face search distinguish "no match" from "faces were never extracted".
     face_stage: Mapped[str] = mapped_column(String(20), default="NOT_RUN", nullable=False)
     face_stage_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Wall-clock seconds spent in each pipeline stage, e.g. {"detection": 41.2}.
+    # NULL for runs made before stage timing was recorded.
+    stage_timings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     visual_attribute_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     vehicle_attribute_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     plate_observations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

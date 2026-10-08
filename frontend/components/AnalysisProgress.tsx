@@ -8,7 +8,24 @@ interface AnalysisProgressProps {
     progress: number;
     onCancel?: () => void;
     errorMessage?: string;
+    stageTimings?: Record<string, number> | null;
 }
+
+// Keys written by the backend runner (analysis_runner.run_stage).
+const TIMING_LABELS: Record<string, string> = {
+    validate: "Validation",
+    sample_frames: "Frame decoding",
+    motion: "Motion",
+    detection: "Detection + attributes",
+    tracking: "Tracking",
+    plates: "Plate OCR",
+    faces: "Face extraction",
+    keyframes: "Keyframes",
+    interactions: "Interactions",
+    events: "Events",
+    manifest: "Manifest",
+    semantic_index: "Captioning + indexing",
+};
 
 const STAGES: { stage: JobStage; label: string }[] = [
     { stage: "VALIDATING", label: "Video Validation" },
@@ -27,8 +44,11 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({
     progress,
     onCancel,
     errorMessage,
+    stageTimings,
 }) => {
     const currentStageIndex = STAGES.findIndex((s) => s.stage === currentStage);
+    const timings = Object.entries(stageTimings ?? {}).sort((a, b) => b[1] - a[1]);
+    const totalSeconds = timings.reduce((sum, [, v]) => sum + v, 0);
 
     return (
         <div className="w-full rounded-xl border border-cyan-500/30 bg-[#0C101C] p-6 shadow-xl text-slate-100 mb-6">
@@ -51,7 +71,7 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({
                     <span className="font-mono text-lg font-bold text-cyan-400">
                         {Math.round(progress)}%
                     </span>
-                    {status === "PROCESSING" && onCancel && (
+                    {(status === "PROCESSING" || status === "QUEUED") && onCancel && (
                         <button
                             onClick={onCancel}
                             className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-950/40 text-red-400 hover:bg-red-900/60 transition-colors"
@@ -69,6 +89,12 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({
                     style={{ width: `${progress}%` }}
                 />
             </div>
+
+            {status === "QUEUED" && (
+                <p className="text-xs text-slate-400 mb-4">
+                    Queued — analyses run one at a time, so this starts when the current one finishes.
+                </p>
+            )}
 
             {/* Error Display */}
             {status === "FAILED" && errorMessage && (
@@ -109,6 +135,24 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({
                     );
                 })}
             </div>
+
+            {status === "COMPLETED" && timings.length > 0 && (
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                    <p className="text-xs text-slate-400 mb-2">
+                        Processing time: <span className="font-mono text-cyan-300">{totalSeconds.toFixed(1)}s</span>
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                        {timings.map(([stage, seconds]) => (
+                            <span
+                                key={stage}
+                                className="text-[11px] font-mono px-2 py-0.5 rounded border border-slate-800 bg-slate-900/60 text-slate-300"
+                            >
+                                {TIMING_LABELS[stage] ?? stage} {seconds.toFixed(1)}s
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
         </div>
     );
 };

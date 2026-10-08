@@ -20,7 +20,9 @@ from app.services.semantic.query_parser import (
     QueryIntentParser,
     INTENT_COUNT, INTENT_FRAME_COUNT, INTENT_SEARCH, INTENT_ATTRIBUTE_SEARCH,
     INTENT_TEMPORAL_SEARCH, INTENT_RELATION_SEARCH, INTENT_EVENT_SEARCH, INTENT_SUMMARY,
+    INTENT_PLATE_LOOKUP,
 )
+from app.services.semantic.structured_answers import structured_search
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +132,16 @@ class InvestigationOrchestrator:
             return await cls._handle_frame_count(
                 db, investigation_id, evidence, evidence_id, job_id,
                 query_text, parsed, structured, video_filename, ev_hash,
+                progress_history, start_time_perf,
+            )
+
+        if intent_type == INTENT_PLATE_LOOKUP or (
+            intent_type == INTENT_ATTRIBUTE_SEARCH
+            and (structured.get("attributes") or {}).get("license_plate_text")
+        ):
+            return await cls._handle_plate(
+                db, investigation_id, evidence_id, job_id,
+                query_text, structured, video_filename, ev_hash,
                 progress_history, start_time_perf,
             )
 
@@ -286,6 +298,53 @@ class InvestigationOrchestrator:
         }
 
     @classmethod
+    async def _handle_plate(
+        cls, db, investigation_id, evidence_id, job_id,
+        query_text, structured, video_filename, ev_hash,
+        progress_history, start_time_perf,
+    ) -> Dict[str, Any]:
+        """Plate questions: the same structured answer semantic search gives."""
+        progress_history.append({
+            "stage": "PLATE_LOOKUP", "status": "IN_PROGRESS",
+            "message": "Reading per-track plate consensus (character-voted OCR).",
+        })
+        answer = await structured_search(db, evidence_id, job_id, structured)
+        findings = answer["results"]
+        progress_history.append({
+            "stage": "PLATE_LOOKUP", "status": "COMPLETED", "message": answer["answer"],
+        })
+        report_md = ForensicReportGenerator.generate_plate_report(
+            investigation_id=investigation_id,
+            video_filename=video_filename,
+            query_text=query_text,
+            answer=answer["answer"],
+            vehicles=answer.get("vehicles", []),
+            analysis_job_id=job_id,
+            evidence_hash=ev_hash,
+        )
+        return {
+            "investigation_id": investigation_id,
+            "evidence_id": evidence_id,
+            "analysis_job_id": job_id,
+            "query": query_text,
+            "status": "COMPLETED" if findings else "NO_SUPPORTED_EVIDENCE",
+            "execution_time_ms": round((time.time() - start_time_perf) * 1000.0, 2),
+            "intent": {
+                "type": structured.get("intent"),
+                "entity": structured.get("entity"),
+                "attributes": structured.get("attributes") or {},
+            },
+            "result": {"answer": answer["answer"], "vehicles": answer.get("vehicles", [])},
+            "evidence_basis": {"primary": "TRACK_ATTRIBUTE_AGGREGATE", "secondary": ["TRACKS"]},
+            "plan": {"goal": "Report licence plates", "tasks": ["list_vehicle_plates"]},
+            "progress": progress_history,
+            "events": [],
+            "findings": findings,
+            "report_markdown": report_md,
+            "diagnostic": {"answer": answer["answer"]},
+        }
+
+    @classmethod
     async def _handle_attribute_search(
         cls, db, investigation_id, evidence_id, job_id,
         query_text, parsed, structured, video_filename, ev_hash,
@@ -375,6 +434,11 @@ class InvestigationOrchestrator:
         if degraded_note:
             report_md += f"\n> **Note**: {degraded_note}\n"
 
+        # Finding cards need title/summary/verification fields; the raw
+        # matches stay in result.matches for the report and API consumers.
+        cards = await structured_search(db, evidence_id, job_id, structured)
+        findings = cards["results"] if cards and cards["results"] else []
+
         return {
             "investigation_id": investigation_id,
             "evidence_id": evidence_id,
@@ -396,7 +460,7 @@ class InvestigationOrchestrator:
                      "tasks": ["find_tracks_by_attributes"]},
             "progress": progress_history,
             "events": [],
-            "findings": matches,
+            "findings": findings,
             "report_markdown": report_md,
             "diagnostic": {
                 "aggregate_rows_in_job": attr_rows,

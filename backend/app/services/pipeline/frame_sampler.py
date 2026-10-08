@@ -22,13 +22,19 @@ class FrameSampler:
         # Determine frame interval step
         step = max(1, int(round(video_fps / target_fps)))
         
+        # Every frame must be decoded (inter-frame codecs), but only sampled
+        # frames are converted to BGR and copied out: grab() skips that work
+        # for the frames we discard, and retrieve() returns the same pixels
+        # read() would.
         frame_idx = 0
         while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            if not cap.grab():
                 break
 
             if frame_idx % step == 0:
+                ret, frame = cap.retrieve()
+                if not ret or frame is None:
+                    break
                 timestamp = round(frame_idx / video_fps, 2)
                 yield (frame_idx, timestamp, frame)
 

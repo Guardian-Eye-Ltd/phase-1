@@ -9,9 +9,13 @@ from app.models.analysis import (
 from app.models.semantic import (
     ForensicDocument, DocumentType, DocumentSourceType
 )
+from app.models.observation import ObservationStatus, TrackAttributeAggregate
 from app.services.pipeline.event_engine import EventEngine
 
 logger = logging.getLogger(__name__)
+
+# Same rule as attribute search: WITHHELD and CONTRADICTED values never surface.
+_ASSERTED_STATUSES = (ObservationStatus.OBSERVED, ObservationStatus.SUPPORTED, ObservationStatus.VERIFIED)
 
 class ForensicDocumentGenerator:
     """
@@ -70,6 +74,19 @@ class ForensicDocumentGenerator:
             select(Detection).where(Detection.analysis_job_id == analysis_job_id)
         )
         detections = det_res.scalars().all()
+
+        # 6. Asserted per-track attribute consensus
+        agg_res = await db.execute(
+            select(TrackAttributeAggregate).where(
+                TrackAttributeAggregate.evidence_id == evidence_id,
+                TrackAttributeAggregate.analysis_job_id == analysis_job_id,
+                TrackAttributeAggregate.status.in_(_ASSERTED_STATUSES),
+            )
+        )
+        asserted_attrs: Dict[int, Dict[str, str]] = {}
+        for agg in agg_res.scalars().all():
+            if agg.value:
+                asserted_attrs.setdefault(agg.track_number, {})[agg.attribute] = agg.value
 
         # Group detections by track_id and frame_number
         track_detections: Dict[int, List[Detection]] = {}
@@ -140,45 +157,45 @@ class ForensicDocumentGenerator:
                 e_str = cls.format_timestamp(inter.end_time)
                 spatial_summary_lines.append(f"in spatial proximity with Track #{other_track} from {s_str} to {e_str}")
 
-            # Extract attributes from detections safely
-            upper_colors = [getattr(d, 'upper_garment_color', None) for d in associated_dets if getattr(d, 'upper_garment_color', None) and getattr(d, 'upper_garment_color', None) != 'unknown']
-            lower_colors = [getattr(d, 'lower_garment_color', None) for d in associated_dets if getattr(d, 'lower_garment_color', None) and getattr(d, 'lower_garment_color', None) != 'unknown']
-            upper_types = [getattr(d, 'upper_garment_type', None) for d in associated_dets if getattr(d, 'upper_garment_type', None) and getattr(d, 'upper_garment_type', None) != 'unknown']
-            lower_types = [getattr(d, 'lower_garment_type', None) for d in associated_dets if getattr(d, 'lower_garment_type', None) and getattr(d, 'lower_garment_type', None) != 'unknown']
-            headwears = [getattr(d, 'headwear', None) for d in associated_dets if getattr(d, 'headwear', None) and getattr(d, 'headwear', None) not in ['unknown', 'bare head']]
-            veh_colors = [getattr(d, 'vehicle_color', None) for d in associated_dets if getattr(d, 'vehicle_color', None) and getattr(d, 'vehicle_color', None) != 'unknown']
-            veh_styles = [getattr(d, 'vehicle_body_style', None) for d in associated_dets if getattr(d, 'vehicle_body_style', None) and getattr(d, 'vehicle_body_style', None) != 'unknown']
-            plates = [getattr(d, 'license_plate_number', None) for d in associated_dets if getattr(d, 'license_plate_number', None)]
-
-            carries_bag = any(getattr(d, 'carries_bag', False) for d in associated_dets) or any(obj in ["backpack", "handbag", "suitcase"] for obj in associated_objects)
-
-            dom_upper_c = upper_colors[0] if upper_colors else None
-            dom_lower_c = lower_colors[0] if lower_colors else None
-            dom_upper_t = upper_types[0] if upper_types else None
-            dom_lower_t = lower_types[0] if lower_types else None
-            dom_headwear = headwears[0] if headwears else None
-            dom_veh_c = veh_colors[0] if veh_colors else None
-            dom_veh_s = veh_styles[0] if veh_styles else None
-            license_plate = plates[0] if plates else None
+            # Attributes come from the per-track temporal consensus (the same
+            # table the People & Vehicles view and attribute search use), and
+            # only asserted values are written: a withheld or contradicted
+            # value must not become searchable text.
+            asserted = asserted_attrs.get(trk.track_number, {})
+            dom_upper_c = asserted.get("upper_garment_color")
+            dom_lower_c = asserted.get("lower_garment_color")
+            dom_upper_t = asserted.get("upper_garment_type")
+            dom_headwear = asserted.get("headwear")
+            dom_veh_c = asserted.get("vehicle_color")
+            dom_veh_s = asserted.get("vehicle_body_style")
+            license_plate = asserted.get("license_plate_text")
+            carried_item = asserted.get("carried_item")
+            bare_torso = asserted.get("upper_garment_presence") == "absent"
 
             attr_parts = []
-            if dom_upper_c or dom_upper_t:
-                garment_desc = f"{dom_upper_c or ''} {dom_upper_t or 'upper garment'}".strip()
-                attr_parts.append(f"wearing a {garment_desc}")
-            if dom_lower_c or dom_lower_t:
-                pants_desc = f"{dom_lower_c or ''} {dom_lower_t or 'lower garment'}".strip()
-                attr_parts.append(f"wearing {pants_desc}")
-            if dom_headwear:
-                attr_parts.append(f"wearing {dom_headwear}")
-            if carries_bag:
-                attr_parts.append("carrying a bag or backpack")
-            if dom_veh_c or dom_veh_s:
-                veh_desc = f"{dom_veh_c or ''} {dom_veh_s or 'vehicle'}".strip()
-                attr_parts.append(f"{veh_desc} body exterior")
+            if bare_torso:
+                attr_parts.append("no upper garment (bare torso, shirtless)")
+            elif dom_upper_c or dom_upper_t:
+                attr_parts.append(f"wearing a {dom_upper_c or ''} {dom_upper_t or 'top'}".replace("  ", " "))
+            if dom_lower_c:
+                attr_parts.append(f"{dom_lower_c} trousers or lower garment")
+            if dom_headwear == "bare head":
+                attr_parts.append("no headwear")
+            elif dom_headwear:
+                attr_parts.append(f"wearing a {dom_headwear}")
+            if carried_item:
+                attr_parts.append(f"carrying a {carried_item}")
+            if dom_veh_c:
+                attr_parts.append(f"{dom_veh_c} {trk.class_name} (colour consensus across frames)")
+            if dom_veh_s:
+                attr_parts.append(f"body style estimate {dom_veh_s}")
             if license_plate:
-                attr_parts.append(f"license plate number '{license_plate}'")
+                attr_parts.append(
+                    f"licence plate / vehicle number {license_plate} "
+                    f"(OCR reads agree on every character)"
+                )
 
-            attr_text = f" Visual attributes: {', '.join(attr_parts)}." if attr_parts else ""
+            attr_text = f" Visual attributes: {'; '.join(attr_parts)}." if attr_parts else ""
             spatial_text = f" Spatial interactions: {'; '.join(spatial_summary_lines)}." if spatial_summary_lines else ""
             assoc_text = f" Associated object detections: {', '.join(associated_objects)}." if associated_objects else ""
 
@@ -204,17 +221,19 @@ class ForensicDocumentGenerator:
                     "track_id": trk.track_number,
                     "class_name": trk.class_name,
                     "duration": trk.duration,
+                    # Asserted consensus values only (see above).
                     "upper_garment_color": dom_upper_c,
                     "lower_garment_color": dom_lower_c,
                     "upper_garment_type": dom_upper_t,
-                    "lower_garment_type": dom_lower_t,
                     "headwear": dom_headwear,
                     "vehicle_color": dom_veh_c,
                     "vehicle_body_style": dom_veh_s,
                     "license_plate_number": license_plate,
+                    "carried_item": carried_item,
+                    "carries_bag": True if carried_item else None,
+                    "attribute_source": "TRACK_ATTRIBUTE_AGGREGATE",
                     "observation_count": trk.observation_count,
                     "associated_classes": associated_objects,
-                    "carries_bag": carries_bag
                 }
             )
             documents.append(doc)

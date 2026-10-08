@@ -383,6 +383,109 @@ class InvestigationToolSystem:
         return results
 
     @classmethod
+    async def list_vehicle_plates(
+        cls,
+        db: AsyncSession,
+        evidence_id: int,
+        analysis_job_id: int,
+        entity: str = "vehicle",
+        track_number: Optional[int] = None,
+        vehicle_color: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Plate status of every vehicle track in scope, for questions that ask
+        for a plate rather than give one ("what is the vehicle number").
+
+        Each vehicle gets exactly one of:
+          READ        - OCR reads agree on every character (OBSERVED or higher)
+          UNCONFIRMED - reads exist but disagree / too few; best guess + reason,
+                        never to be presented as the vehicle's number
+          NOT_READ    - no plate text at all, with the reason
+        A colour filter uses asserted colour consensus only, as attribute search does.
+        """
+        from app.models.evidence import Evidence
+        from app.services.pipeline.alpr_service import plate_unread_reason
+        from app.services.pipeline.capability_registry import get_capability
+
+        classes = {c.lower() for c in classes_for_entity(entity or "vehicle")} or set(all_vehicle_classes())
+        conds = [Track.evidence_id == evidence_id, Track.analysis_job_id == analysis_job_id]
+        if track_number is not None:
+            conds.append(Track.track_number == track_number)
+        tracks = [t for t in (await db.execute(select(Track).where(*conds).order_by(Track.track_number))).scalars().all()
+                  if t.class_name.lower() in classes]
+
+        aggs = (await db.execute(select(TrackAttributeAggregate).where(
+            TrackAttributeAggregate.evidence_id == evidence_id,
+            TrackAttributeAggregate.analysis_job_id == analysis_job_id,
+            TrackAttributeAggregate.attribute.in_(("license_plate_text", "vehicle_color")),
+        ))).scalars().all()
+        by_track: Dict[int, Dict[str, TrackAttributeAggregate]] = {}
+        for a in aggs:
+            by_track.setdefault(a.track_number, {})[a.attribute] = a
+
+        def asserted_colour(track_id: int) -> Optional[str]:
+            c = by_track.get(track_id, {}).get("vehicle_color")
+            return c.value if c is not None and c.status in _ASSERTED_STATUSES else None
+
+        if vehicle_color:
+            tracks = [t for t in tracks if (asserted_colour(t.track_number) or "").lower() == vehicle_color.lower()]
+
+        # Largest view of each track, for "too small to read" explanations.
+        evidence = (await db.execute(select(Evidence).where(Evidence.id == evidence_id))).scalars().first()
+        frame_w = None
+        if evidence and evidence.resolution and "x" in evidence.resolution:
+            try:
+                frame_w = int(evidence.resolution.split("x")[0])
+            except ValueError:
+                pass
+        widths = dict((await db.execute(
+            select(Detection.track_id, func.max(Detection.bbox_x2 - Detection.bbox_x1))
+            .where(Detection.analysis_job_id == analysis_job_id, Detection.track_id.isnot(None))
+            .group_by(Detection.track_id)
+        )).all())
+        plate_cap = get_capability("license_plate_text")
+
+        vehicles = []
+        for t in tracks:
+            agg = by_track.get(t.track_number, {}).get("license_plate_text")
+            breakdown = (agg.confidence_breakdown or {}) if agg is not None else {}
+            if agg is not None and agg.value and agg.status in _ASSERTED_STATUSES:
+                plate = {"status": "READ", "text": agg.value, "reason": None}
+            elif agg is not None and agg.value:
+                plate = {"status": "UNCONFIRMED", "text": agg.value,
+                         "reason": breakdown.get("withheld_reason") or "OCR reads too few or inconsistent"}
+            else:
+                width_px = int(widths.get(t.track_number, 0) * frame_w) if frame_w else None
+                reason = (plate_cap["reason"] if plate_cap["state"] == "NOT_AVAILABLE"
+                          else plate_unread_reason(width_px))
+                plate = {"status": "NOT_READ", "text": None, "reason": reason}
+            if agg is not None:
+                plate.update({
+                    "evidence_tier": agg.status.value,
+                    "confidence": agg.confidence,
+                    "reads_total": agg.observation_count,
+                    "reads_considered": breakdown.get("reads_considered"),
+                    "format_complete": breakdown.get("format_complete"),
+                    "format_issue": breakdown.get("format_issue"),
+                })
+            vehicles.append({
+                "track_id": t.track_number,
+                "class_name": t.class_name,
+                "start_time": t.first_seen_timestamp,
+                "end_time": t.last_seen_timestamp,
+                "observation_count": t.observation_count,
+                "vehicle_color": asserted_colour(t.track_number),
+                "plate": plate,
+            })
+
+        order = {"READ": 0, "UNCONFIRMED": 1, "NOT_READ": 2}
+        vehicles.sort(key=lambda v: (order[v["plate"]["status"]], -(v["plate"].get("confidence") or 0), v["track_id"]))
+        counts = {s: sum(1 for v in vehicles if v["plate"]["status"] == s) for s in order}
+        logger.info("[PLATE_LOOKUP] job=%s entity=%s track=%s colour=%s -> %s",
+                    analysis_job_id, entity, track_number, vehicle_color, counts)
+        return {"analysis_job_id": analysis_job_id, "vehicles": vehicles, "counts": counts}
+
+    @classmethod
     async def get_visual_attributes(
         cls,
         db: AsyncSession,

@@ -17,6 +17,22 @@ INTENT_TEMPORAL_SEARCH = "TEMPORAL_SEARCH"
 INTENT_RELATION_SEARCH = "RELATION_SEARCH"
 INTENT_EVENT_SEARCH = "EVENT_SEARCH"
 INTENT_SUMMARY = "SUMMARY"
+INTENT_PLATE_LOOKUP = "PLATE_LOOKUP"
+
+
+# Requests for a licence plate without giving one: "what is the vehicle
+# number", "number plate of the white car", "registration of track 4".
+# Stripped before count detection, so "vehicle number of track 4" is not
+# read as "number of" (a count).
+_PLATE_REQUEST_RE = re.compile(
+    r"\b(?:(?:vehicle|car|bike|truck|bus|van|registration|reg)\s+(?:number|no)s?"
+    r"|number\s*-?\s*plates?|licen[cs]e\s*-?\s*plates?|plate\s*(?:number|no)s?"
+    r"|registration|plates?|anpr|alpr)\b"
+)
+
+
+def _strip_plate_phrases(text_lower: str) -> str:
+    return _PLATE_REQUEST_RE.sub(" ", text_lower)
 
 
 # Phrases that unambiguously indicate aggregation.
@@ -89,6 +105,34 @@ _PLATE_STOPWORDS = {
 }
 
 
+_PLATE_CUE_FILLER = {"OF", "THE", "IS", "NO", "NUMBER", "NUM", "FOR", "WITH", "A", "AN", "AS"}
+_PLATE_CUE_STOP = {"CAR", "BUS", "VAN", "CARS", "BIKE", "TRACK", "AND", "NEAR", "AT"}
+
+
+def _cued_plate(upper: str) -> List[str]:
+    """
+    Plate text written after a cue word, possibly spaced ("plate KA 03 K 961").
+    Only plate-like fragments are joined (anything with a digit, or 1-3
+    letters), so "plate of track 14" never yields "OFTRACK14".
+    """
+    found = []
+    for cue in re.finditer(r"\b(?:PLATES?|REGISTRATION|REGO)\b", upper):
+        tokens = re.findall(r"[A-Z0-9]+", upper[cue.end():])
+        while tokens and tokens[0] in _PLATE_CUE_FILLER:
+            tokens.pop(0)
+        parts = []
+        for tok in tokens:
+            if tok in _PLATE_CUE_STOP or tok in _PLATE_STOPWORDS:
+                break
+            if re.search(r"\d", tok) or len(tok) <= 3:
+                parts.append(tok)
+            else:
+                break
+        if parts:
+            found.append("".join(parts))
+    return found
+
+
 def _extract_plate_candidate(text_lower: str) -> Optional[str]:
     """
     Pull an explicit licence-plate token out of a query.
@@ -99,16 +143,9 @@ def _extract_plate_candidate(text_lower: str) -> Optional[str]:
     """
     upper = text_lower.upper()
 
-    # Explicit cue ("plate KL01AB1234", "number plate ABC123") takes priority.
-    cued = re.search(
-        r"(?:PLATE|REGISTRATION|REGO|NUMBER\s+PLATE)\s*(?:NO\.?|NUMBER|IS|=|:)?\s*([A-Z0-9][A-Z0-9\- ]{3,11}[A-Z0-9])",
-        upper,
-    )
-    candidates = []
-    if cued:
-        candidates.append(cued.group(1))
-    else:
-        candidates.extend(re.findall(r"\b[A-Z0-9]{5,10}\b", upper))
+    # Explicit cue ("plate KL01AB1234", "number plate KA 03 K 961") first,
+    # then any standalone plate-shaped token.
+    candidates = _cued_plate(upper) + re.findall(r"\b[A-Z0-9]{5,10}\b", upper)
 
     for raw in candidates:
         token = re.sub(r"[^A-Z0-9]", "", raw)
@@ -222,7 +259,9 @@ class QueryIntentParser:
             "is_timeline_query": False,
             "is_activity_query": False,
             "is_behavioral_query": False,
-            "is_count_query": bool(re.search(r"\b(how many|count|total number|number of)\b", text_lower)),
+            "is_count_query": bool(re.search(r"\b(how many|count|total number|number of)\b",
+                                             _strip_plate_phrases(text_lower))),
+            "plate_request": bool(_PLATE_REQUEST_RE.search(text_lower)),
             "query_type": "OBJECT_SEARCH",
             "candidate_document_types": ["TRACK", "KEYFRAME", "BEHAVIORAL_EVENT"],
             "required_evidence": []
@@ -380,7 +419,8 @@ class QueryIntentParser:
         entity = _detect_entity(text_lower)
         base["entity"] = entity
 
-        has_count_trigger = any(re.search(p, text_lower) for p in _COUNT_TRIGGERS)
+        count_text = _strip_plate_phrases(text_lower)
+        has_count_trigger = any(re.search(p, count_text) for p in _COUNT_TRIGGERS)
         timestamp = _parse_timestamp_phrase(text_lower)
 
         # ----- SUMMARY -----
@@ -435,6 +475,17 @@ class QueryIntentParser:
             base["intent"] = INTENT_ATTRIBUTE_SEARCH
             base["entity"] = entity or "vehicle"
             base["attributes"] = {"license_plate_text": plate}
+            base["confidence"] = 0.95
+            return base
+
+        # ----- PLATE_LOOKUP: a plate is asked for, not given -----
+        if legacy.get("plate_request"):
+            base["intent"] = INTENT_PLATE_LOOKUP
+            vehicle_entities = ("car", "truck", "bus", "motorcycle", "van", "vehicle", "bicycle")
+            base["entity"] = entity if entity in vehicle_entities else "vehicle"
+            base["track_id"] = legacy.get("track_id")
+            if legacy.get("colors"):
+                base["attributes"] = {"vehicle_color": _canonical_colour(legacy["colors"][0])}
             base["confidence"] = 0.95
             return base
 

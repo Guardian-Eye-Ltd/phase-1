@@ -43,18 +43,49 @@ active_job_cancellations = set()
 # DB status column, because a crashed run leaves a row stuck at PROCESSING forever.
 running_analysis_jobs: set = set()
 
+# One analysis at a time. Every stage already uses all CPU cores, so a second
+# concurrent run only doubles peak memory (all sampled frames are held at once).
+# Queued runs wait here; the API stays responsive because heavy stages run in
+# worker threads rather than on the event loop.
+_analysis_slot = asyncio.Semaphore(1)
+
+
 async def run_analysis_job_async(job_id: int):
     """
     Background worker orchestrating the full Phase 1B computer vision pipeline
     and Phase 1C automatic evidence-grounded semantic indexing.
     """
+    # Registered before waiting for the slot so a reset is refused while a
+    # run is queued, not only while it executes.
+    running_analysis_jobs.add(job_id)
+    try:
+        async with _analysis_slot:
+            await _run_analysis_job(job_id)
+    finally:
+        active_job_cancellations.discard(job_id)
+        running_analysis_jobs.discard(job_id)
+
+
+async def _run_analysis_job(job_id: int):
     start_perf_time = time.time()
+    timings: dict = {}
+
+    async def run_stage(stage: str, fn, *args, **kwargs):
+        """Run blocking pipeline work in a worker thread and record its wall time."""
+        t0 = time.perf_counter()
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        finally:
+            timings[stage] = round(timings.get(stage, 0.0) + time.perf_counter() - t0, 2)
 
     async with SessionLocal() as db:
         result = await db.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))
         job = result.scalar_one_or_none()
         if not job:
             logger.error(f"[VIDEO] Analysis job {job_id} not found.")
+            return
+        if job.status == JobStatus.CANCELLED or job_id in active_job_cancellations:
+            logger.info(f"[VIDEO] Analysis job {job_id} was cancelled while queued.")
             return
 
         evidence_res = await db.execute(select(Evidence).where(Evidence.id == job.evidence_id))
@@ -84,14 +115,13 @@ async def run_analysis_job_async(job_id: int):
         await db.execute(delete(FaceObservation).where(FaceObservation.analysis_job_id == job.id))
         await db.commit()
 
-        running_analysis_jobs.add(job_id)
         try:
             # Stage 1: Video Validation
             if job_id in active_job_cancellations:
                 raise asyncio.CancelledError("Job cancelled by user.")
 
             logger.info(f"[VIDEO] Validating video evidence file: {evidence.file_path}")
-            video_info = VideoValidator.validate_video(evidence.file_path)
+            video_info = await run_stage("validate", VideoValidator.validate_video, evidence.file_path)
             
             # Stage 2: Extracting Metadata
             job.current_stage = JobStage.EXTRACTING_METADATA
@@ -116,10 +146,10 @@ async def run_analysis_job_async(job_id: int):
             await db.commit()
 
             logger.info(f"[FRAME] Sampling video at {job.sampling_fps} FPS...")
-            sampled_frames = list(FrameSampler.sample_frames(
-                evidence.file_path, 
-                target_fps=job.sampling_fps
-            ))
+            sampled_frames = await run_stage(
+                "sample_frames",
+                lambda: list(FrameSampler.sample_frames(evidence.file_path, target_fps=job.sampling_fps)),
+            )
 
             # Batch insert frame observations
             db.add_all([
@@ -143,7 +173,7 @@ async def run_analysis_job_async(job_id: int):
             job.progress = 40.0
             await db.commit()
 
-            motion_intervals = MotionFilter.analyze_motion(sampled_frames)
+            motion_intervals = await run_stage("motion", MotionFilter.analyze_motion, sampled_frames)
             db.add_all([
                 ActivityInterval(
                     analysis_job_id=job.id,
@@ -167,14 +197,17 @@ async def run_analysis_job_async(job_id: int):
             job.progress = 55.0
             await db.commit()
 
-            detector = ObjectDetector(
+            # Constructing the detector loads YOLO, pose and CLIP weights on first use.
+            detector = await run_stage(
+                "detection",
+                ObjectDetector,
                 model_name=settings.YOLO_MODEL_NAME,
                 confidence_threshold=job.confidence_threshold,
                 iou_threshold=settings.DETECTION_IOU_THRESHOLD,
-                max_processing_dim=settings.MAX_PROCESSING_RESOLUTION
+                max_processing_dim=settings.MAX_PROCESSING_RESOLUTION,
             )
 
-            raw_detections = detector.detect_batch(sampled_frames, batch_size=16)
+            raw_detections = await run_stage("detection", detector.detect_batch, sampled_frames, batch_size=16)
             # Count how many distinct frames had at least one detection
             frames_with_dets = len(set(d["frame_number"] for d in raw_detections))
             raw_detection_count = len(raw_detections)
@@ -195,24 +228,24 @@ async def run_analysis_job_async(job_id: int):
             track_summaries = []
 
             if job.tracking_enabled and raw_detections:
-                tracker = MultiObjectTracker(
-                    iou_threshold=settings.DETECTION_IOU_THRESHOLD,
-                    max_time_lost=3.0
-                )
-                
-                # Group by frame and process chronologically
-                by_frame = {}
-                for d in raw_detections:
-                    fn = d["frame_number"]
-                    by_frame.setdefault(fn, []).append(d)
+                def _track():
+                    tracker = MultiObjectTracker(
+                        iou_threshold=settings.DETECTION_IOU_THRESHOLD,
+                        max_time_lost=3.0
+                    )
 
-                final_detections = []
-                for fn, frame_ts, _ in sampled_frames:
-                    if fn in by_frame:
-                        tracked_dets = tracker.process_frame_detections(by_frame[fn])
-                        final_detections.extend(tracked_dets)
+                    # Group by frame and process chronologically
+                    by_frame = {}
+                    for d in raw_detections:
+                        by_frame.setdefault(d["frame_number"], []).append(d)
 
-                track_summaries = MultiObjectTracker.generate_track_summaries(final_detections)
+                    tracked = []
+                    for fn, frame_ts, _ in sampled_frames:
+                        if fn in by_frame:
+                            tracked.extend(tracker.process_frame_detections(by_frame[fn]))
+                    return tracked, MultiObjectTracker.generate_track_summaries(tracked)
+
+                final_detections, track_summaries = await run_stage("tracking", _track)
 
             # Batch Save Detections & Tracks
             db.add_all([
@@ -261,8 +294,8 @@ async def run_analysis_job_async(job_id: int):
 
             # Licence plates: read once per vehicle track on its best frames.
             if caps.get("license_plate_text", {}).get("state") != "NOT_AVAILABLE":
-                attr_observations += await asyncio.to_thread(
-                    read_vehicle_plates, sampled_frames, final_detections
+                attr_observations += await run_stage(
+                    "plates", read_vehicle_plates, sampled_frames, final_detections
                 )
 
             _MODEL_BY_SOURCE = {
@@ -344,12 +377,12 @@ async def run_analysis_job_async(job_id: int):
             face_cap = get_capability("face_recognition")
             if face_cap["state"] == "NOT_AVAILABLE":
                 job.face_stage, job.face_stage_detail = "UNAVAILABLE", face_cap["reason"]
-            elif not await asyncio.to_thread(FaceEngine.load):
+            elif not await run_stage("faces", FaceEngine.load):
                 job.face_stage, job.face_stage_detail = "UNAVAILABLE", FaceEngine.load_error()
             else:
                 try:
-                    face_obs = await asyncio.to_thread(
-                        extract_faces, sampled_frames, final_detections,
+                    face_obs = await run_stage(
+                        "faces", extract_faces, sampled_frames, final_detections,
                         evidence.id, job.id, settings.DERIVED_STORAGE_DIR,
                     )
                     db.add_all([
@@ -391,7 +424,9 @@ async def run_analysis_job_async(job_id: int):
             job.progress = 85.0
             await db.commit()
 
-            keyframes_data = KeyframeExtractor.extract_keyframes(
+            keyframes_data = await run_stage(
+                "keyframes",
+                KeyframeExtractor.extract_keyframes,
                 sampled_frames,
                 final_detections,
                 track_summaries,
@@ -415,7 +450,7 @@ async def run_analysis_job_async(job_id: int):
                 for k in keyframes_data
             ])
 
-            interactions = InteractionDetector.detect_interactions(final_detections)
+            interactions = await run_stage("interactions", InteractionDetector.detect_interactions, final_detections)
             db.add_all([
                 PossibleInteraction(
                     analysis_job_id=job.id,
@@ -438,7 +473,7 @@ async def run_analysis_job_async(job_id: int):
             await db.commit()
 
             # Run deterministic event engine for loitering, proximity, and carried objects
-            detected_events = EventEngine.detect_events(track_summaries, final_detections)
+            detected_events = await run_stage("events", EventEngine.detect_events, track_summaries, final_detections)
 
             # Run-time counters (only knowable now). Stored-entity counts are
             # recomputed from the DB by compute_analysis_statistics.
@@ -474,7 +509,9 @@ async def run_analysis_job_async(job_id: int):
             # One timestamp for both the manifest and the job row, so the stored
             # manifest and the job record describe the same moment.
             finished_at = datetime.utcnow()
-            manifest_dict, manifest_hash = ManifestGenerator.generate_manifest(
+            manifest_dict, manifest_hash = await run_stage(
+                "manifest",
+                ManifestGenerator.generate_manifest,
                 evidence_id=evidence.id,
                 analysis_job_id=job.id,
                 source_sha256=evidence.sha256_hash,
@@ -492,11 +529,14 @@ async def run_analysis_job_async(job_id: int):
                 events=detected_events,
                 capabilities=caps,
             )
-            ManifestGenerator.save_manifest(
-                ManifestGenerator.manifest_path(evidence.id, job.id), manifest_dict
+            await run_stage(
+                "manifest",
+                ManifestGenerator.save_manifest,
+                ManifestGenerator.manifest_path(evidence.id, job.id), manifest_dict,
             )
 
             job.manifest_hash = manifest_hash
+            job.stage_timings = dict(timings)
             job.status = JobStatus.COMPLETED
             job.progress = 100.0
             job.completed_at = finished_at
@@ -525,7 +565,11 @@ async def run_analysis_job_async(job_id: int):
 
             # Automatic Evidence-Grounded Semantic Indexing
             logger.info(f"[EMBEDDING] Auto-triggering semantic indexing for evidence {evidence.id}, job {job.id}...")
+            t0 = time.perf_counter()
             await SemanticIndexer.index_evidence_async(evidence.id, job.id)
+            timings["semantic_index"] = round(time.perf_counter() - t0, 2)
+            job.stage_timings = dict(timings)
+            await db.commit()
 
         except asyncio.CancelledError:
             logger.warning(f"[VIDEO] Analysis job {job_id} was cancelled.")
@@ -549,7 +593,3 @@ async def run_analysis_job_async(job_id: int):
             )
             db.add(audit_log)
             await db.commit()
-
-        finally:
-            active_job_cancellations.discard(job_id)
-            running_analysis_jobs.discard(job_id)

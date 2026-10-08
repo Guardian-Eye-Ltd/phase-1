@@ -343,6 +343,8 @@ class AttributeAggregator:
                 "agreement": vote.get("agreement", 0.0),
                 "min_position_majority": vote.get("min_position_majority", 0.0),
                 "reads_considered": vote.get("reads_considered", 0),
+                "format_complete": vote.get("format_complete", False),
+                "format_issue": vote.get("format_issue"),
                 "capability": capability,
                 "withheld_reason": vote.get("reason", ""),
             },
